@@ -2994,3 +2994,233 @@ where
             })
     }
 }
+
+#[cfg(test)]
+mod crash_atomicity {
+    use super::*;
+    use object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+
+    /// An `ObjectStore` decorator that fails `put_opts` to any path containing
+    /// `fail_substring`, but only once `armed`. Simulates a broker dying
+    /// mid-write: the write never lands, mirroring an ungraceful shutdown.
+    #[derive(Debug)]
+    struct FaultStore {
+        inner: Arc<dyn ObjectStore>,
+        fail_substring: String,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl Display for FaultStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultStore({})", self.fail_substring)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FaultStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult, object_store::Error> {
+            if self.armed.load(Ordering::SeqCst) && location.as_ref().contains(&self.fail_substring)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "FaultStore",
+                    source: "injected fault: simulated crash".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> Result<GetResult, object_store::Error> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path, object_store::Error>>,
+        ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> Result<ListResult, object_store::Error> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> Result<(), object_store::Error> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// Number of record (batch) objects under a partition's `records/` prefix.
+    async fn record_count(store: &Arc<dyn ObjectStore>, partition: i32) -> usize {
+        let prefix = Path::from(format!(
+            "clusters/test/topics/t/partitions/{partition:0>10}/records/"
+        ));
+        store
+            .list(Some(&prefix))
+            .filter_map(|result| async move { result.ok() })
+            .count()
+            .await
+    }
+
+    /// A single-record transactional data batch for `producer_id` (first batch
+    /// of the partition, so `base_sequence` 0).
+    fn txn_data_batch(producer_id: i64, value: &'static [u8]) -> deflated::Batch {
+        inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(value).into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_id)
+            .producer_epoch(0)
+            .base_sequence(0)
+            .last_offset_delta(0)
+            .build()
+            .and_then(TryInto::try_into)
+            .expect("deflated txn batch")
+    }
+
+    /// Proves the object-store transaction path is not crash-atomic: a failure
+    /// while writing the *second* partition's commit marker leaves a torn
+    /// transaction (one partition committed, the other not), and the periodic
+    /// `maintain()` tick does not repair it.
+    #[tokio::test]
+    async fn txn_commit_is_not_crash_atomic() {
+        // Backing store + a probe handle sharing the same data (InMemory is Arc-backed).
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let probe = Arc::clone(&mem);
+        let armed = Arc::new(AtomicBool::new(false));
+
+        let storage = DynoStore::new(
+            "test",
+            111,
+            FaultStore {
+                inner: mem,
+                // Fail the SECOND partition's record (marker) write once armed.
+                fail_substring: "partitions/0000000001/records".to_string(),
+                armed: Arc::clone(&armed),
+            },
+        );
+
+        // topic "t" with two partitions
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(2)
+                    .replication_factor(1)
+                    .assignments(Some(vec![]))
+                    .configs(Some(vec![])),
+                false,
+            )
+            .await
+            .expect("create_topic");
+
+        // transactional producer
+        let producer = storage
+            .init_producer(Some("tx"), 0, Some(-1), Some(-1))
+            .await
+            .expect("init_producer");
+        let pid = producer.id;
+
+        // begin the transaction over both partitions (sets state = Begin)
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: "tx".into(),
+                producer_id: pid,
+                producer_epoch: 0,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name("t".into())
+                        .partitions(Some(vec![0, 1])),
+                ],
+            })
+            .await
+            .expect("txn_add_partitions");
+
+        // produce one transactional record to each partition (both succeed)
+        _ = storage
+            .produce(
+                Some("tx"),
+                &Topition::new("t", 0),
+                txn_data_batch(pid, b"p0"),
+            )
+            .await
+            .expect("produce p0");
+        _ = storage
+            .produce(
+                Some("tx"),
+                &Topition::new("t", 1),
+                txn_data_batch(pid, b"p1"),
+            )
+            .await
+            .expect("produce p1");
+
+        // each partition holds exactly its data batch so far
+        assert_eq!(1, record_count(&probe, 0).await);
+        assert_eq!(1, record_count(&probe, 1).await);
+
+        // ── arm the fault: the broker "dies" while writing partition 1's marker ──
+        armed.store(true, Ordering::SeqCst);
+
+        let result = storage.txn_end("tx", pid, 0, true).await;
+        assert!(
+            result.is_err(),
+            "txn_end should surface the injected write failure"
+        );
+
+        // ── THE BUG: torn commit ──
+        // partition 0 got its commit marker (2 objects); partition 1 did not (1).
+        assert_eq!(
+            2,
+            record_count(&probe, 0).await,
+            "p0 should have data + commit marker"
+        );
+        assert_eq!(
+            1,
+            record_count(&probe, 1).await,
+            "p1 is missing its commit marker -> TORN transaction"
+        );
+
+        // ── THE SECOND HALF: no recovery ──
+        // disarm (writes could now succeed) and run the periodic maintenance tick.
+        armed.store(false, Ordering::SeqCst);
+        storage.maintain(SystemTime::now()).await.expect("maintain");
+
+        assert_eq!(
+            1,
+            record_count(&probe, 1).await,
+            "maintain() did not re-drive the prepared txn -> the tear is permanent"
+        );
+    }
+}
