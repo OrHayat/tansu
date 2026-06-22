@@ -301,6 +301,12 @@ struct TxnDetail {
     state: Option<TxnState>,
     produces: BTreeMap<Topic, BTreeMap<Partition, Option<TxnProduceOffset>>>,
     offsets: BTreeMap<Group, BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>>,
+
+    /// Partitions whose commit/abort marker has been durably written. Tracked so
+    /// an interrupted `txn_end` can be resumed (by `maintain`) without writing a
+    /// marker twice. Cleared on finalize.
+    #[serde(default)]
+    marked: BTreeMap<Topic, BTreeSet<Partition>>,
 }
 
 impl From<&TxnDetail> for BTreeMap<Topition, Offset> {
@@ -524,6 +530,54 @@ impl DynoStore {
         }
 
         Ok(responses)
+    }
+
+    /// Re-drive any transaction left in a prepared state by a broker that died
+    /// mid-`txn_end`: write the markers that did not land, then finalize. Runs on
+    /// every `maintain` tick and is idempotent via the per-transaction `marked`
+    /// set, so re-running -- or a concurrent run on another broker -- does not
+    /// write a marker twice.
+    async fn recover_prepared_transactions(&self) -> Result<()> {
+        let prepared = self
+            .meta
+            .with(&self.object_store, |meta| {
+                let mut prepared = vec![];
+
+                for (transaction_id, transaction) in &meta.transactions {
+                    for (producer_epoch, txn_detail) in &transaction.epochs {
+                        if let Some(state) = txn_detail.state
+                            && state.is_prepared()
+                        {
+                            prepared.push((
+                                transaction_id.to_owned(),
+                                transaction.producer,
+                                *producer_epoch,
+                                state == TxnState::PrepareCommit,
+                            ));
+                        }
+                    }
+                }
+
+                Ok(prepared)
+            })
+            .await?;
+
+        for (transaction_id, producer_id, producer_epoch, committed) in prepared {
+            _ = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, committed)
+                .await
+                .inspect_err(|err| {
+                    warn!(
+                        ?err,
+                        transaction_id,
+                        producer_id,
+                        producer_epoch,
+                        "recovering prepared transaction"
+                    )
+                });
+        }
+
+        Ok(())
     }
 }
 
@@ -2450,23 +2504,33 @@ impl Storage for DynoStore {
 
                 let txn_detail = current_epoch.get_mut();
 
+                // Durably record the decision on the first call; a retry or the
+                // recovery path finds it already Prepare* and simply resumes.
+                if txn_detail.state == Some(TxnState::Begin) {
+                    _ = txn_detail.state.replace(if committed {
+                        TxnState::PrepareCommit
+                    } else {
+                        TxnState::PrepareAbort
+                    });
+                }
+
+                // Markers are owed for every produced-to partition not yet marked.
+                // Deriving this from the durable record on *every* call (rather
+                // than only on the Begin -> Prepare* edge) is what lets an
+                // interrupted commit be re-driven without dropping partitions.
                 let mut produced = vec![];
 
-                if txn_detail.state == Some(TxnState::Begin) {
-                    assert_eq!(
-                        Some(TxnState::Begin),
-                        txn_detail.state.replace(if committed {
-                            TxnState::PrepareCommit
-                        } else {
-                            TxnState::PrepareAbort
-                        })
-                    );
-
+                if txn_detail.state.is_some_and(|state| state.is_prepared()) {
                     for (topic, partitions) in &txn_detail.produces {
                         for (partition, offset_range) in partitions {
                             debug!(?topic, partition, ?offset_range);
 
-                            if offset_range.is_some() {
+                            let marked = txn_detail
+                                .marked
+                                .get(topic)
+                                .is_some_and(|marked| marked.contains(partition));
+
+                            if offset_range.is_some() && !marked {
                                 produced.push(Topition::new(topic.to_owned(), *partition));
                             }
                         }
@@ -2532,6 +2596,25 @@ impl Storage for DynoStore {
                         committed,
                     )
                 })?;
+
+            // Mark the partition only after its marker is durable, so a crash
+            // mid-loop resumes from the next unmarked partition (never a dup).
+            self.meta
+                .with_mut(&self.object_store, |meta| {
+                    if let Some(transaction) = meta.transactions.get_mut(transaction_id)
+                        && let Some(txn_detail) = transaction.epochs.get_mut(&producer_epoch)
+                    {
+                        _ = txn_detail
+                            .marked
+                            .entry(topition.topic.clone())
+                            .or_default()
+                            .insert(topition.partition);
+                    }
+
+                    Ok(())
+                })
+                .await
+                .inspect_err(|err| error!(?err))?;
         }
 
         let offsets_to_commit = self
@@ -2626,6 +2709,7 @@ impl Storage for DynoStore {
 
                             txn_detail.produces.clear();
                             txn_detail.offsets.clear();
+                            txn_detail.marked.clear();
                             _ = txn_detail.started_at.take();
                         }
                     }
@@ -2663,6 +2747,8 @@ impl Storage for DynoStore {
     }
 
     async fn maintain(&self, _now: SystemTime) -> Result<()> {
+        self.recover_prepared_transactions().await?;
+
         if let Some(ref lake) = self.lake {
             return lake
                 .maintain()
@@ -3110,12 +3196,12 @@ mod crash_atomicity {
             .expect("deflated txn batch")
     }
 
-    /// Proves the object-store transaction path is not crash-atomic: a failure
-    /// while writing the *second* partition's commit marker leaves a torn
-    /// transaction (one partition committed, the other not), and the periodic
-    /// `maintain()` tick does not repair it.
+    /// A failure while writing the *second* partition's commit marker leaves a
+    /// transaction torn (one partition marked, the other not). The periodic
+    /// `maintain()` tick must re-drive the prepared transaction and write the
+    /// missing marker -- restoring atomicity.
     #[tokio::test]
-    async fn txn_commit_is_not_crash_atomic() {
+    async fn interrupted_txn_commit_is_recovered_by_maintain() {
         // Backing store + a probe handle sharing the same data (InMemory is Arc-backed).
         let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let probe = Arc::clone(&mem);
@@ -3199,7 +3285,7 @@ mod crash_atomicity {
             "txn_end should surface the injected write failure"
         );
 
-        // ── THE BUG: torn commit ──
+        // ── torn commit (before recovery) ──
         // partition 0 got its commit marker (2 objects); partition 1 did not (1).
         assert_eq!(
             2,
@@ -3212,15 +3298,16 @@ mod crash_atomicity {
             "p1 is missing its commit marker -> TORN transaction"
         );
 
-        // ── THE SECOND HALF: no recovery ──
-        // disarm (writes could now succeed) and run the periodic maintenance tick.
+        // ── RECOVERY: maintain() re-drives the interrupted commit ──
+        // disarm (writes succeed again) and run the periodic maintenance tick.
         armed.store(false, Ordering::SeqCst);
         storage.maintain(SystemTime::now()).await.expect("maintain");
 
+        // partition 1's missing marker is now written -> the tear is healed.
         assert_eq!(
-            1,
+            2,
             record_count(&probe, 1).await,
-            "maintain() did not re-drive the prepared txn -> the tear is permanent"
+            "maintain() should recover the prepared txn and write partition 1's marker"
         );
     }
 }
