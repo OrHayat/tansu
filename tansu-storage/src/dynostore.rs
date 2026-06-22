@@ -432,6 +432,57 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
+    /// Fetch, decode, and conditionally append the record batch stored at
+    /// `base`. A batch whose records all fall below `offset` -- a predecessor
+    /// listed only because Kafka returns the batch that contains the fetch
+    /// offset whole -- is decoded and dropped. Returns `false` once the byte
+    /// budget is spent (the batch is appended first, so a fetch always makes
+    /// progress).
+    async fn read_record_batch(
+        &self,
+        topition: &Topition,
+        base: i64,
+        offset: i64,
+        batches: &mut Vec<deflated::Batch>,
+        remaining: &mut u64,
+    ) -> Result<bool> {
+        let location = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+            self.cluster, topition.topic, topition.partition, base,
+        ));
+
+        let get_result = self
+            .object_store
+            .get(&location)
+            .await
+            .inspect_err(|error| error!(?error, ?topition, ?base, ?offset))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
+
+        let size = get_result.meta.size;
+
+        let mut batch = get_result
+            .bytes()
+            .await
+            .inspect_err(|error| error!(?error, %location))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+            .and_then(|encoded| self.decode(encoded))?;
+        batch.base_offset = base;
+
+        // A predecessor whose records all sit below the fetch offset is dropped.
+        if base + i64::from(batch.last_offset_delta) < offset {
+            return Ok(true);
+        }
+
+        batches.push(batch);
+
+        Ok(if size > *remaining {
+            false
+        } else {
+            *remaining -= size;
+            true
+        })
+    }
+
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
     where
         V: DeserializeOwned,
@@ -1043,93 +1094,123 @@ impl Storage for DynoStore {
 
         debug!(high_watermark);
 
-        let mut offsets = BTreeSet::new();
-
-        if offset < high_watermark {
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-                self.cluster, topition.topic, topition.partition
-            ));
-
-            let mut list_stream = self.object_store.list(Some(&location));
-
-            while let Some(meta) = list_stream
-                .next()
-                .await
-                .inspect(|meta| debug!(?meta))
-                .transpose()
-                .inspect_err(|error| error!(?error, ?topition, ?offset, ?min_bytes, ?max_bytes))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                && !has_deadline_expired()
-            {
-                let Some(offset) = meta.location.parts().next_back() else {
-                    continue;
-                };
-
-                let offset = i64::from_str(&offset.as_ref()[0..20])?;
-                debug!(offset);
-
-                if offset < high_watermark {
-                    _ = offsets.insert(offset);
-                }
-            }
-        }
-
-        let mut wanted = offsets.split_off(&offset);
-
-        // The fetch offset can fall inside a batch that starts before it;
-        // Kafka returns that batch whole, leaving the client to skip the
-        // records below the fetch offset. The preceding batch is dropped
-        // after decoding if it ends before the fetch offset.
-        if wanted.first().copied() != Some(offset)
-            && let Some(preceding) = offsets.pop_last()
-        {
-            _ = wanted.insert(preceding);
-        }
-
         let mut batches = vec![];
 
         let mut bytes = max_bytes as u64;
 
-        for base_offset in wanted {
-            debug!(?base_offset);
-
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                self.cluster, topition.topic, topition.partition, base_offset,
+        if offset < high_watermark {
+            let prefix = Path::from(format!(
+                "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+                self.cluster, topition.topic, topition.partition
             ));
 
-            let get_result = self
+            // Seek straight to the fetch offset instead of enumerating the whole
+            // partition. Filenames are zero-padded to 20 digits, so lexicographic
+            // order == numeric order; the start key (no `.batch` suffix) sorts
+            // just below `{offset}.batch`, so the listing begins at base == offset.
+            let start_after = Path::from(format!(
+                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
+                self.cluster, topition.topic, topition.partition, offset,
+            ));
+
+            let mut seek = self
                 .object_store
-                .get(&location)
+                .list_with_offset(Some(&prefix), &start_after);
+
+            // The first batch at or after `offset`.
+            let mut head = None;
+            while let Some(meta) = seek
+                .next()
                 .await
-                .inspect_err(|error| {
-                    error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
-                })
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
-
-            let size = get_result.meta.size;
-
-            let mut batch = get_result
-                .bytes()
-                .await
-                .inspect_err(|error| error!(?error, %location))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                .and_then(|encoded| self.decode(encoded))?;
-            batch.base_offset = base_offset;
-
-            if base_offset + i64::from(batch.last_offset_delta) >= offset {
-                batches.push(batch);
-
-                if size > bytes {
+                .transpose()
+                .inspect_err(|error| error!(?error, ?topition, ?offset, ?min_bytes, ?max_bytes))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            {
+                if let Some(name) = meta.location.parts().next_back() {
+                    let base = i64::from_str(&name.as_ref()[0..20])?;
+                    if base < high_watermark {
+                        head = Some(base);
+                    }
                     break;
                 }
-
-                bytes = bytes.saturating_sub(size);
             }
 
-            if has_deadline_expired() {
-                break;
+            if head == Some(offset) {
+                // Boundary fetch (the common, sequential-consume case): read
+                // forward from the seek -- no full-prefix enumeration.
+                let mut base = head;
+
+                while let Some(current) = base {
+                    if has_deadline_expired()
+                        || !self
+                            .read_record_batch(topition, current, offset, &mut batches, &mut bytes)
+                            .await?
+                    {
+                        break;
+                    }
+
+                    base = None;
+                    while let Some(meta) = seek
+                        .next()
+                        .await
+                        .transpose()
+                        .inspect_err(|error| error!(?error, ?topition, ?offset))
+                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                    {
+                        if let Some(name) = meta.location.parts().next_back() {
+                            let next = i64::from_str(&name.as_ref()[0..20])?;
+                            if next < high_watermark {
+                                base = Some(next);
+                            }
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // `offset` is not a batch boundary (a mid-batch seek, or after
+                // compaction): a forward seek can't see the batch that *contains*
+                // it, so fall back to a full enumeration to recover the
+                // predecessor that Kafka returns whole.
+                let mut offsets = BTreeSet::new();
+                let mut list_stream = self.object_store.list(Some(&prefix));
+
+                while let Some(meta) = list_stream
+                    .next()
+                    .await
+                    .inspect(|meta| debug!(?meta))
+                    .transpose()
+                    .inspect_err(|error| error!(?error, ?topition, ?offset, ?min_bytes, ?max_bytes))
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                    && !has_deadline_expired()
+                {
+                    if let Some(name) = meta.location.parts().next_back() {
+                        let base = i64::from_str(&name.as_ref()[0..20])?;
+                        if base < high_watermark {
+                            _ = offsets.insert(base);
+                        }
+                    }
+                }
+
+                let mut wanted = offsets.split_off(&offset);
+
+                // The fetch offset can fall inside a batch that starts before it;
+                // Kafka returns that batch whole, leaving the client to skip the
+                // records below the fetch offset.
+                if wanted.first().copied() != Some(offset)
+                    && let Some(preceding) = offsets.pop_last()
+                {
+                    _ = wanted.insert(preceding);
+                }
+
+                for base in wanted {
+                    if has_deadline_expired()
+                        || !self
+                            .read_record_batch(topition, base, offset, &mut batches, &mut bytes)
+                            .await?
+                    {
+                        break;
+                    }
+                }
             }
         }
 
@@ -2920,6 +3001,19 @@ where
         self.object_store.list(prefix)
     }
 
+    // Forwarded explicitly: the trait default re-lists the whole prefix and
+    // filters client-side, defeating the underlying store's native start-after
+    // seek that `fetch` relies on.
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        debug!(?prefix, ?offset);
+
+        self.object_store.list_with_offset(prefix, offset)
+    }
+
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
@@ -2992,5 +3086,259 @@ where
                 additional.append(&mut attributes);
                 self.request_error.add(1, &additional[..]);
             })
+    }
+}
+
+#[cfg(test)]
+mod fetch_seek {
+    use super::*;
+    use object_store::memory::InMemory;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    /// Counts, for the records prefix only, unbounded `list` vs seeking
+    /// `list_with_offset` calls, and records the start-after key of the latter.
+    #[derive(Debug)]
+    struct ListSpy {
+        inner: Arc<dyn ObjectStore>,
+        list_calls: Arc<AtomicUsize>,
+        seek_calls: Arc<AtomicUsize>,
+        last_seek: Arc<Mutex<Option<String>>>,
+    }
+
+    fn is_records(prefix: Option<&Path>) -> bool {
+        prefix.is_some_and(|p| p.as_ref().contains("/records"))
+    }
+
+    impl Display for ListSpy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ListSpy")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ListSpy {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult, object_store::Error> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> Result<GetResult, object_store::Error> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path, object_store::Error>>,
+        ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+            if is_records(prefix) {
+                _ = self.list_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+            if is_records(prefix) {
+                _ = self.seek_calls.fetch_add(1, Ordering::SeqCst);
+                *self.last_seek.lock().unwrap() = Some(offset.as_ref().to_string());
+            }
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> Result<ListResult, object_store::Error> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> Result<(), object_store::Error> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    type SpyHandles = (
+        ListSpy,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Option<String>>>,
+    );
+
+    fn spy() -> SpyHandles {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let seek_calls = Arc::new(AtomicUsize::new(0));
+        let last_seek = Arc::new(Mutex::new(None));
+        let store = ListSpy {
+            inner: mem,
+            list_calls: Arc::clone(&list_calls),
+            seek_calls: Arc::clone(&seek_calls),
+            last_seek: Arc::clone(&last_seek),
+        };
+        (store, list_calls, seek_calls, last_seek)
+    }
+
+    /// A non-transactional batch carrying `records` records (offsets
+    /// `base..base+records`).
+    fn batch(records: usize) -> deflated::Batch {
+        let mut builder = inflated::Batch::builder();
+        for _ in 0..records {
+            builder = builder.record(Record::builder().value(Bytes::from_static(b"x").into()));
+        }
+        builder
+            .last_offset_delta(records as i32 - 1)
+            .build()
+            .and_then(TryInto::try_into)
+            .expect("deflated batch")
+    }
+
+    async fn topic(storage: &DynoStore) {
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some(vec![]))
+                    .configs(Some(vec![])),
+                false,
+            )
+            .await
+            .expect("create_topic");
+    }
+
+    /// A boundary fetch (offset starts a batch) seeks with `list_with_offset`
+    /// through Cache + Metron and never enumerates the whole records prefix.
+    #[tokio::test]
+    async fn boundary_fetch_seeks_without_full_scan() {
+        let (store, list_calls, seek_calls, last_seek) = spy();
+        let storage = DynoStore::new("test", 111, store);
+        topic(&storage).await;
+
+        // five single-record batches -> offsets 0..=4, each a batch boundary
+        for _ in 0..5 {
+            _ = storage
+                .produce(None, &Topition::new("t", 0), batch(1))
+                .await
+                .expect("produce");
+        }
+
+        list_calls.store(0, Ordering::SeqCst);
+        seek_calls.store(0, Ordering::SeqCst);
+
+        let batches = storage
+            .fetch(
+                &Topition::new("t", 0),
+                3,
+                0,
+                1 << 20,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch");
+
+        assert_eq!(
+            0,
+            list_calls.load(Ordering::SeqCst),
+            "a boundary fetch must not enumerate the whole prefix"
+        );
+        assert!(
+            seek_calls.load(Ordering::SeqCst) >= 1,
+            "fetch must seek with list_with_offset (through Cache + Metron)"
+        );
+        assert!(
+            last_seek
+                .lock()
+                .unwrap()
+                .as_deref()
+                .unwrap()
+                .contains("00000000000000000003"),
+            "start-after key should target the requested offset"
+        );
+        assert_eq!(2, batches.len());
+        assert_eq!(3, batches[0].base_offset);
+        assert_eq!(4, batches[1].base_offset);
+    }
+
+    /// A mid-batch fetch (offset falls inside a batch that starts before it)
+    /// returns that batch whole, falling back to a full scan to recover the
+    /// predecessor a forward seek can't see.
+    #[tokio::test]
+    async fn mid_batch_fetch_returns_the_containing_batch() {
+        let (store, list_calls, _seek_calls, _last_seek) = spy();
+        let storage = DynoStore::new("test", 111, store);
+        topic(&storage).await;
+
+        // a 3-record batch at base 0 (offsets 0,1,2), then a 1-record batch at base 3
+        _ = storage
+            .produce(None, &Topition::new("t", 0), batch(3))
+            .await
+            .expect("produce");
+        _ = storage
+            .produce(None, &Topition::new("t", 0), batch(1))
+            .await
+            .expect("produce");
+
+        list_calls.store(0, Ordering::SeqCst);
+
+        // offset 1 falls inside the base-0 batch
+        let batches = storage
+            .fetch(
+                &Topition::new("t", 0),
+                1,
+                0,
+                1 << 20,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch");
+
+        // the containing batch (base 0) is returned whole, plus the next batch
+        assert_eq!(2, batches.len());
+        assert_eq!(
+            0, batches[0].base_offset,
+            "must return the batch that contains offset 1"
+        );
+        assert_eq!(3, batches[1].base_offset);
+        assert!(
+            list_calls.load(Ordering::SeqCst) >= 1,
+            "a mid-batch fetch falls back to a full scan to find the predecessor"
+        );
     }
 }

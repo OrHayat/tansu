@@ -364,6 +364,20 @@ where
         self.object_store.list(prefix)
     }
 
+    // Forwarded explicitly: the trait default re-lists the whole prefix and
+    // filters client-side, defeating the underlying store's native start-after
+    // seek that `fetch` relies on.
+    #[instrument(skip_all, fields(prefix, offset))]
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        debug!(?prefix, ?offset);
+        REQUESTS.add(1, &[KeyValue::new("method", "list_with_offset")]);
+        self.object_store.list_with_offset(prefix, offset)
+    }
+
     #[instrument(skip_all, fields(prefix))]
     async fn list_with_delimiter(
         &self,
