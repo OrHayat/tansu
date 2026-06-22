@@ -579,6 +579,63 @@ impl DynoStore {
 
         Ok(())
     }
+
+    /// Abort transactions stuck in `Begin` past their timeout -- e.g. a producer
+    /// that died before committing. Such a transaction pins its partitions' LSO
+    /// forever, blocking every `read_committed` consumer (head-of-line). Run on
+    /// each `maintain` tick; aborting just re-uses `txn_end` with `committed =
+    /// false`, which writes the abort markers and finalizes to `Aborted`.
+    async fn abort_timed_out_transactions(&self, now: SystemTime) -> Result<()> {
+        let expired = self
+            .meta
+            .with(&self.object_store, |meta| {
+                let mut expired = vec![];
+
+                for (transaction_id, transaction) in &meta.transactions {
+                    for (producer_epoch, txn_detail) in &transaction.epochs {
+                        // A timeout of 0 means "no timeout"; only abandoned Begin
+                        // transactions are eligible.
+                        let timed_out = txn_detail.transaction_timeout_ms > 0
+                            && txn_detail.started_at.is_some_and(|started_at| {
+                                now.duration_since(started_at).is_ok_and(|elapsed| {
+                                    elapsed
+                                        > Duration::from_millis(
+                                            txn_detail.transaction_timeout_ms as u64,
+                                        )
+                                })
+                            });
+
+                        if txn_detail.state == Some(TxnState::Begin) && timed_out {
+                            expired.push((
+                                transaction_id.to_owned(),
+                                transaction.producer,
+                                *producer_epoch,
+                            ));
+                        }
+                    }
+                }
+
+                Ok(expired)
+            })
+            .await?;
+
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            _ = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+                .inspect_err(|err| {
+                    warn!(
+                        ?err,
+                        transaction_id,
+                        producer_id,
+                        producer_epoch,
+                        "aborting timed-out transaction"
+                    )
+                });
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2746,7 +2803,8 @@ impl Storage for DynoStore {
         Ok(ErrorCode::None)
     }
 
-    async fn maintain(&self, _now: SystemTime) -> Result<()> {
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
+        self.abort_timed_out_transactions(now).await?;
         self.recover_prepared_transactions().await?;
 
         if let Some(ref lake) = self.lake {
@@ -3308,6 +3366,86 @@ mod crash_atomicity {
             2,
             record_count(&probe, 1).await,
             "maintain() should recover the prepared txn and write partition 1's marker"
+        );
+    }
+
+    /// A producer that begins a transaction, produces, then dies without
+    /// committing leaves it stuck in `Begin` -- pinning the partition's LSO
+    /// forever and blocking every `read_committed` consumer. A `maintain` tick
+    /// past the transaction timeout must abort it (write the abort marker),
+    /// releasing the partition.
+    #[tokio::test]
+    async fn timed_out_begin_txn_is_aborted_by_maintain() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let probe = Arc::clone(&mem);
+
+        // a never-armed FaultStore, reused purely as a passthrough wrapper
+        let storage = DynoStore::new(
+            "test",
+            111,
+            FaultStore {
+                inner: mem,
+                fail_substring: "never".to_string(),
+                armed: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some(vec![]))
+                    .configs(Some(vec![])),
+                false,
+            )
+            .await
+            .expect("create_topic");
+
+        // transactional producer with a 1s timeout
+        let producer = storage
+            .init_producer(Some("tx"), 1_000, Some(-1), Some(-1))
+            .await
+            .expect("init_producer");
+        let pid = producer.id;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: "tx".into(),
+                producer_id: pid,
+                producer_epoch: 0,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name("t".into())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await
+            .expect("txn_add_partitions");
+
+        // produce one transactional record, then the producer "dies" (never commits)
+        _ = storage
+            .produce(
+                Some("tx"),
+                &Topition::new("t", 0),
+                txn_data_batch(pid, b"work"),
+            )
+            .await
+            .expect("produce");
+
+        // just the data batch, no marker; the transaction is stuck in Begin
+        assert_eq!(1, record_count(&probe, 0).await);
+
+        // a maintenance tick well past the 1s timeout
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        storage.maintain(future).await.expect("maintain");
+
+        // the abandoned Begin txn is aborted -> abort marker written, LSO released
+        assert_eq!(
+            2,
+            record_count(&probe, 0).await,
+            "timed-out Begin txn should be aborted (abort marker written)"
         );
     }
 }
