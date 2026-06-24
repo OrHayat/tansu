@@ -283,6 +283,112 @@ async fn test_offset_stage_with_transaction() {
     assert_eq!(2, stage.last_stable);
 }
 
+#[tokio::test]
+async fn test_maintain_aborts_timed_out_transaction() {
+    use std::time::{Duration, SystemTime};
+
+    use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+
+    use crate::TxnState;
+
+    let engine = create_test_engine().await;
+
+    let topic = CreatableTopic::default()
+        .name("timeout-txn-topic".into())
+        .num_partitions(1)
+        .replication_factor(1);
+    let _ = engine.create_topic(topic, false).await.unwrap();
+
+    let topition = Topition::new("timeout-txn-topic", 0);
+
+    // Produce a non-transactional batch so the high watermark advances.
+    let batch = Batch {
+        base_offset: 0,
+        batch_length: 0,
+        partition_leader_epoch: 0,
+        magic: 2,
+        crc: 0,
+        attributes: 0,
+        last_offset_delta: 0,
+        base_timestamp: 1000,
+        max_timestamp: 1000,
+        producer_id: -1,
+        producer_epoch: -1,
+        base_sequence: -1,
+        record_count: 1,
+        record_data: Bytes::new(),
+    };
+    let _ = engine
+        .produce(None, &topition, batch.clone())
+        .await
+        .unwrap();
+
+    let stage = engine.offset_stage(&topition).await.unwrap();
+    assert_eq!(1, stage.high_watermark);
+    assert_eq!(1, stage.last_stable);
+
+    // Begin a transaction with a short, non-zero timeout and add the partition.
+    let timeout_ms: i32 = 1;
+    let producer = engine
+        .init_producer(Some("timeout-txn"), timeout_ms, Some(-1), Some(-1))
+        .await
+        .unwrap();
+
+    let request = TxnAddPartitionsRequest::VersionZeroToThree {
+        transaction_id: "timeout-txn".into(),
+        producer_id: producer.id,
+        producer_epoch: producer.epoch,
+        topics: vec![
+            AddPartitionsToTxnTopic::default()
+                .name("timeout-txn-topic".into())
+                .partitions(Some(vec![0])),
+        ],
+    };
+    let _ = engine.txn_add_partitions(request).await.unwrap();
+
+    // Produce within the transaction so it pins an offset range below the
+    // high watermark.
+    let txn_batch = Batch {
+        producer_id: producer.id,
+        producer_epoch: producer.epoch,
+        base_sequence: 0,
+        ..batch.clone()
+    };
+    let _ = engine
+        .produce(Some("timeout-txn"), &topition, txn_batch)
+        .await
+        .unwrap();
+
+    // The in-flight transaction pins the last stable offset below the high
+    // watermark.
+    let stage = engine.offset_stage(&topition).await.unwrap();
+    assert_eq!(2, stage.high_watermark);
+    assert_eq!(1, stage.last_stable);
+    assert!(stage.last_stable < stage.high_watermark);
+
+    // Confirm the transaction is still in `Begin` before maintenance runs.
+    let transactions = engine.get_transactions().await.unwrap();
+    let txn = transactions.get("timeout-txn").unwrap();
+    let (_, detail) = txn.epochs.last_key_value().unwrap();
+    assert_eq!(Some(TxnState::Begin), detail.state);
+
+    // Run maintenance with `now` well past the transaction deadline.
+    let now =
+        SystemTime::now() + Duration::from_millis(timeout_ms as u64) + Duration::from_secs(60);
+    engine.maintain(now).await.unwrap();
+
+    // (a) The transaction is no longer in `Begin` (it was aborted, so it no
+    // longer pins the partition).
+    let transactions = engine.get_transactions().await.unwrap();
+    let txn = transactions.get("timeout-txn").unwrap();
+    let (_, detail) = txn.epochs.last_key_value().unwrap();
+    assert_ne!(Some(TxnState::Begin), detail.state);
+
+    // (b) The last stable offset is no longer pinned below the high watermark.
+    let stage = engine.offset_stage(&topition).await.unwrap();
+    assert_eq!(stage.high_watermark, stage.last_stable);
+}
+
 // ========== Idempotent Producer Tests ==========
 
 #[tokio::test]

@@ -77,6 +77,62 @@ const RETENTION_MS: &str = "retention.ms";
 const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl Engine {
+    /// Abort transactions stuck in `Begin` past their timeout -- e.g. a producer
+    /// that died before committing. Such a transaction pins its partitions' last
+    /// stable offset, blocking every read_committed consumer. Aborting re-uses
+    /// `txn_end` with `committed = false`, which writes abort markers and moves
+    /// the transaction towards `Aborted`. Note that `txn_end` may instead leave
+    /// the transaction in `PrepareAbort` when it overlaps other unprepared
+    /// transactions; `offset_stage` still treats `PrepareAbort` as in-progress,
+    /// so the last stable offset is only released once a later `maintain` pass
+    /// (or another `txn_end`) finalizes the overlap to `Aborted`. A timeout of 0
+    /// means "no timeout". Run from `maintain`.
+    async fn abort_timed_out_transactions(&self, now: SystemTime) -> Result<()> {
+        let transactions = self.get_transactions().await?;
+
+        let mut expired = vec![];
+        for (transaction_id, txn) in transactions.iter() {
+            for (producer_epoch, txn_detail) in txn.epochs.iter() {
+                let timed_out = txn_detail.transaction_timeout_ms > 0
+                    && txn_detail.started_at.is_some_and(|started_at| {
+                        now.duration_since(started_at).is_ok_and(|elapsed| {
+                            elapsed
+                                > Duration::from_millis(txn_detail.transaction_timeout_ms as u64)
+                        })
+                    });
+
+                if txn_detail.state == Some(TxnState::Begin) && timed_out {
+                    expired.push((transaction_id.clone(), txn.producer, *producer_epoch));
+                }
+            }
+        }
+
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            match self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                Ok(ErrorCode::None) => {}
+                Ok(error_code) => tracing::warn!(
+                    ?error_code,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "timed-out transaction abort rejected",
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "aborting timed-out transaction failed",
+                ),
+            }
+        }
+
+        Ok(())
+    }
+
     fn topic_config<'a>(metadata: &'a TopicMetadata, name: &str) -> Option<&'a str> {
         metadata
             .topic
@@ -2670,6 +2726,8 @@ impl Storage for Engine {
     /// maintenance if configured. This aligns with PG's maintain
     /// implementation.
     async fn maintain(&self, now: SystemTime) -> Result<()> {
+        self.abort_timed_out_transactions(now).await?;
+
         let deleted = self.policy_delete(now).await?;
         debug!(deleted);
 
