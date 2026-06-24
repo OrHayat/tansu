@@ -1134,6 +1134,65 @@ impl Delegate {
         Ok(ErrorCode::None)
     }
 
+    /// Abort transactions stuck in BEGIN past their transaction_timeout_ms.
+    ///
+    /// A transactional producer that dies after AddPartitionsToTxn but before
+    /// commit/abort leaves the transaction open forever. read_committed
+    /// consumers can only advance to the Last Stable Offset, which is pinned to
+    /// the oldest open transaction, so a single abandoned BEGIN blocks every
+    /// read_committed consumer on that partition (head-of-line blocking). The
+    /// timed-out transactions are selected in SQL (started_at +
+    /// transaction_timeout_ms older than now; a timeout of 0 means "no
+    /// timeout") and aborted via the regular txn_end path with committed=false.
+    async fn abort_timed_out_transactions(&self) -> Result<()> {
+        let expired = {
+            let connection = self.connection().await?;
+
+            let mut rows = connection
+                .query(
+                    "lite/txn_detail_select_timed_out.sql",
+                    [self.cluster.as_str()],
+                )
+                .await?;
+
+            let mut expired = vec![];
+
+            while let Some(row) = rows.next().await? {
+                let transaction_id = row.get::<String>(0)?;
+                let producer_id = row.get::<i64>(1)?;
+                let producer_epoch = row.get::<i32>(2)? as i16;
+                expired.push((transaction_id, producer_id, producer_epoch));
+            }
+
+            expired
+        };
+
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            match self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                Ok(ErrorCode::None) => {}
+                Ok(error_code) => warn!(
+                    ?error_code,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "timed-out transaction abort rejected"
+                ),
+                Err(err) => warn!(
+                    ?err,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "aborting timed-out transaction failed"
+                ),
+            }
+        }
+
+        Ok(())
+    }
+
     #[instrument(skip(self), ret)]
     async fn policy_compact_delete(&self, topition: i64, offset_id: i64) -> Result<u64> {
         let pc = self.connection().await?;
@@ -4706,6 +4765,10 @@ impl Storage for Delegate {
             return Ok(());
         };
 
+        if let Err(err) = self.abort_timed_out_transactions().await {
+            warn!(?err, "aborting timed-out transactions failed");
+        }
+
         let start = SystemTime::now();
 
         let deleted = self.policy_delete(now).await?;
@@ -5420,6 +5483,147 @@ mod tests {
             .create_topic(creatable_topic, false)
             .await
             .inspect(|uuid| debug!(?uuid))?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintain_aborts_timed_out_transaction() -> Result<()> {
+        use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+
+        let _guard = init_tracing()?;
+
+        // libSQL's build() relativizes the URL path to the crate dir, so use a
+        // crate-local file DB. Clean up any leftovers from a previous run.
+        let db_file = "lite-timeout-abort-test.db";
+        for s in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{db_file}{s}"));
+        }
+
+        let storage = Url::parse("file:///lite-timeout-abort-test.db")?;
+        let cluster = "tansu";
+        let node = 12321;
+        let topic = "timeout-topic";
+        let transaction_id = "timeout-test-txn";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        let _uuid = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic, 0);
+
+        // Start a transactional producer and add a partition to the transaction.
+        let producer = engine
+            .init_producer(Some(transaction_id), 60_000, Some(-1), Some(-1))
+            .await?;
+
+        let _ = engine
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.into(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic.into())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        // Produce within the transaction so it is in BEGIN with started_at set.
+        let batch = inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Bytes::from_static(b"k").into())
+                    .value(Bytes::from_static(b"v").into()),
+            )
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let _offset = engine
+            .produce(Some(transaction_id), &topition, batch)
+            .await?;
+
+        // Force the transaction to look timed out: with a 60s timeout, pushing
+        // started_at an hour into the past makes the deadline ~59 minutes ago.
+        // Use a second connection to the same crate-local file (WAL mode).
+        let raw = libsql::Builder::new_local(db_file).build().await?;
+        let raw_conn = raw.connect()?;
+
+        // Scope every txn_detail read/write to this test's transaction (by
+        // cluster + txn.name) so concurrent rows from other tests can't make the
+        // row counts or status assertions lie.
+        let txn_detail_for_test = "\
+            select td.status from txn_detail td \
+            join txn on txn.id = td.\"transaction\" \
+            join cluster c on c.id = txn.cluster \
+            where c.name = ?1 and txn.name = ?2";
+
+        let status_before: String = {
+            let mut rows = raw_conn
+                .query(txn_detail_for_test, (cluster, transaction_id))
+                .await?;
+            rows.next().await?.unwrap().get::<String>(0)?
+        };
+        assert_eq!("BEGIN", status_before);
+
+        let updated = raw_conn
+            .execute(
+                "update txn_detail set started_at = datetime(current_timestamp, '-1 hour') \
+                 where \"transaction\" in ( \
+                     select txn.id from txn \
+                     join cluster c on c.id = txn.cluster \
+                     where c.name = ?1 and txn.name = ?2)",
+                (cluster, transaction_id),
+            )
+            .await?;
+        assert_eq!(1, updated);
+
+        // Run maintenance: the timed-out BEGIN transaction must be aborted.
+        engine.maintain(SystemTime::now()).await?;
+
+        let status_after: String = {
+            let mut rows = raw_conn
+                .query(txn_detail_for_test, (cluster, transaction_id))
+                .await?;
+            rows.next().await?.unwrap().get::<String>(0)?
+        };
+        assert_eq!("ABORTED", status_after);
+
+        // Tidy up the crate-local DB files.
+        drop(raw_conn);
+        for s in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{db_file}{s}"));
+        }
 
         Ok(())
     }

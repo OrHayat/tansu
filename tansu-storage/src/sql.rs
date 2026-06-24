@@ -165,6 +165,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             "lite/policy_delete.sql",
             include_sql!("lite/policy_delete.sql"),
         ),
+        (
+            "lite/txn_detail_select_timed_out.sql",
+            include_sql!("lite/txn_detail_select_timed_out.sql"),
+        ),
         ("lite/vacuum_into.sql", include_sql!("lite/vacuum_into.sql")),
         ("policy_compact.sql", include_sql!("sql/policy_compact.sql")),
         ("policy_delete.sql", include_sql!("sql/policy_delete.sql")),
