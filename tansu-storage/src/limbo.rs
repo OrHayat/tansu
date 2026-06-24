@@ -894,6 +894,92 @@ impl Engine {
 
         Ok(ErrorCode::None)
     }
+
+    /// Abort transactions that are still in `BEGIN` past their
+    /// `transaction_timeout_ms`.
+    ///
+    /// An abandoned `BEGIN` transaction pins the Last Stable Offset to the
+    /// start of the oldest open transaction, so a single producer that dies
+    /// after `AddPartitionsToTxn` but before commit/abort blocks every
+    /// read_committed consumer on the partition. Kafka producers advertise a
+    /// `transaction_timeout_ms`; the broker must abort transactions that
+    /// exceed it.
+    ///
+    /// The timer starts when the first partition is added (`started_at`). The
+    /// expiry comparison is done in SQL against the database
+    /// `current_timestamp` so it uses the same clock that wrote `started_at`
+    /// (hence `now` from the caller is not used here). A
+    /// `transaction_timeout_ms` of 0 means "no timeout" and is skipped.
+    async fn abort_timed_out_transactions(&self, _now: SystemTime) -> Result<()> {
+        let connection = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        let mut expired = vec![];
+
+        {
+            let mut rows = connection
+                .query(
+                    &sql_lookup("limbo/txn_detail_select_timed_out.sql")?,
+                    (self.cluster.as_str(),),
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
+
+            while let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
+                let transaction_id = row.get_value(0).map_err(Into::into).and_then(|value| {
+                    value
+                        .as_text()
+                        .cloned()
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
+
+                let producer_id = row.get_value(1).map_err(Into::into).and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
+
+                let producer_epoch = row.get_value(2).map_err(Into::into).and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .map(|epoch| epoch as i16)
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
+
+                expired.push((transaction_id, producer_id, producer_epoch));
+            }
+        }
+
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            // Best-effort maintenance sweep: a single abort failure (or a
+            // rejected abort) is logged and skipped rather than failing
+            // `maintain`, so it cannot block the other timed-out transactions
+            // in this sweep or other maintenance work.
+            match self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                Ok(ErrorCode::None) => {}
+                Ok(error_code) => tracing::warn!(
+                    ?error_code,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "timed-out transaction abort rejected"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "aborting timed-out transaction failed"
+                ),
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default, Debug)]
@@ -3628,7 +3714,11 @@ impl Storage for Engine {
         Ok(error_code)
     }
 
-    async fn maintain(&self, _now: SystemTime) -> Result<()> {
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
+        if let Err(err) = self.abort_timed_out_transactions(now).await {
+            tracing::warn!(?err, "aborting timed-out transactions failed");
+        }
+
         Ok(())
     }
 
@@ -4217,6 +4307,173 @@ mod tests {
             .create_topic(creatable_topic, false)
             .await
             .inspect(|uuid| debug!(?uuid))?;
+
+        Ok(())
+    }
+
+    // SQL-level test for the transaction-timeout-abort query.
+    //
+    // The turso/limbo engine is immature: the Engine-level produce flow
+    // (register_broker -> create_topic -> init_producer -> add_partitions ->
+    // produce) cannot run end-to-end here. The Engine tests above
+    // (`register_broker`, `storage_create_topic`, `produce`) are all
+    // `#[ignore]`d for this reason, and `storage_create_topic` fails with
+    // `Turso(SqlExecutionFailure("I/O error: entity not found"))` when run.
+    //
+    // limbo's DDL parser also rejects the shared production schema: e.g.
+    // `ddl/020-producer.sql` (`cluster int references cluster (id) on delete
+    // cascade not null`) fails with `unexpected token` because it does not
+    // accept a `not null` constraint following an inline `references ... on
+    // delete cascade`. So the tables below are created inline with the same
+    // column names and semantics the query joins on, avoiding the unsupported
+    // constraint ordering, rather than loading the .sql DDL files.
+    //
+    // The test exercises the timeout selection at the SQL level: it builds the
+    // cluster/producer/producer_epoch/txn/txn_detail rows directly, then runs
+    // `txn_detail_select_timed_out.sql` verbatim (the query `maintain` ->
+    // `abort_timed_out_transactions` feeds into `txn_end`) and asserts it
+    // selects exactly the timed-out BEGIN transaction and nothing else.
+    #[tokio::test]
+    async fn timed_out_transaction_query_selects_only_expired() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let file_path = temp_dir.path().join("tansu.db");
+
+        let db = turso::Builder::new_local(file_path.to_str().unwrap())
+            .build()
+            .await?;
+        let connection = db.connect()?;
+
+        // Minimal schema matching the columns/joins of
+        // txn_detail_select_timed_out.sql. Inline DDL avoids the limbo DDL
+        // parser limitation described above.
+        for ddl in [
+            "create table cluster (
+                id integer primary key autoincrement,
+                name text not null unique
+            )",
+            "create table producer (
+                id integer primary key autoincrement,
+                cluster integer not null references cluster (id)
+            )",
+            "create table producer_epoch (
+                id integer primary key autoincrement,
+                producer integer not null references producer (id),
+                epoch integer not null default 0
+            )",
+            "create table txn (
+                id integer primary key autoincrement,
+                cluster integer not null references cluster (id),
+                name text,
+                producer integer not null references producer (id)
+            )",
+            "create table txn_detail (
+                id integer primary key autoincrement,
+                \"transaction\" integer not null references txn (id),
+                producer_epoch integer not null references producer_epoch (id),
+                transaction_timeout_ms integer not null,
+                started_at text,
+                status text
+            )",
+        ] {
+            _ = connection.execute(ddl, ()).await?;
+        }
+
+        let cluster = "tansu";
+
+        _ = connection
+            .execute("insert into cluster (name) values (?1)", &[cluster])
+            .await?;
+
+        // one producer with a single epoch shared by every transaction below
+        _ = connection
+            .execute(
+                "insert into producer (cluster) select c.id from cluster c where c.name = ?1",
+                &[cluster],
+            )
+            .await?;
+
+        _ = connection
+            .execute(
+                "insert into producer_epoch (producer, epoch)
+                 select p.id, 0 from producer p",
+                (),
+            )
+            .await?;
+
+        // Helper: insert a transaction in BEGIN with the given started_at
+        // (SQLite datetime modifier relative to now) and timeout.
+        async fn insert_begin_txn(
+            connection: &Connection,
+            cluster: &str,
+            name: &str,
+            started_at_modifier: &str,
+            transaction_timeout_ms: i64,
+        ) -> Result<()> {
+            _ = connection
+                .execute(
+                    "insert into txn (cluster, name, producer)
+                     select c.id, ?2, p.id
+                     from cluster c, producer p
+                     where c.name = ?1",
+                    (cluster, name),
+                )
+                .await?;
+
+            _ = connection
+                .execute(
+                    "insert into txn_detail
+                        (\"transaction\", producer_epoch, transaction_timeout_ms, started_at, status)
+                     select txn.id, pe.id, ?3, datetime('now', ?4), 'BEGIN'
+                     from cluster c
+                     join txn on txn.cluster = c.id
+                     join producer p on p.cluster = c.id
+                     join producer_epoch pe on pe.producer = p.id
+                     where c.name = ?1 and txn.name = ?2",
+                    (
+                        cluster,
+                        name,
+                        transaction_timeout_ms,
+                        started_at_modifier,
+                    ),
+                )
+                .await?;
+
+            Ok(())
+        }
+
+        // expired: started an hour ago with a 60s timeout
+        insert_begin_txn(&connection, cluster, "expired", "-1 hour", 60_000).await?;
+
+        // fresh: started now with a 60s timeout -> not yet expired
+        insert_begin_txn(&connection, cluster, "fresh", "+0 seconds", 60_000).await?;
+
+        // disabled: started an hour ago but timeout 0 means "no timeout"
+        insert_begin_txn(&connection, cluster, "disabled", "-1 hour", 0).await?;
+
+        let mut rows = connection
+            .query(
+                &fix_parameters(&include_sql!("limbo/txn_detail_select_timed_out.sql"))?,
+                (cluster,),
+            )
+            .await?;
+
+        let mut selected = vec![];
+        while let Some(row) = rows.next().await? {
+            let name = row.get_value(0).map_err(Into::into).and_then(|value| {
+                value
+                    .as_text()
+                    .cloned()
+                    .ok_or(Error::UnexpectedValue(value))
+            })?;
+            selected.push(name);
+        }
+
+        debug!(?selected);
+
+        selected.sort();
+        assert_eq!(vec![String::from("expired")], selected);
 
         Ok(())
     }
