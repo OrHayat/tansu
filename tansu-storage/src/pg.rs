@@ -1300,6 +1300,54 @@ impl Postgres {
         tx.commit().await.map_err(Into::into).and(Ok(deleted))
     }
 
+    async fn abort_timed_out_transactions(&self) -> Result<()> {
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        let rows = self
+            .prepare_query(&c, "txn_detail_select_timed_out.sql", &[&self.cluster])
+            .await
+            .inspect_err(|err| error!(?err, cluster = ?self.cluster))?;
+
+        let mut expired = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let transaction_id = row
+                .try_get::<_, String>(0)
+                .inspect_err(|err| error!(?err))?;
+            let producer_id = row.try_get::<_, i64>(1).inspect_err(|err| error!(?err))?;
+            let producer_epoch = row.try_get::<_, i16>(2).inspect_err(|err| error!(?err))?;
+
+            expired.push((transaction_id, producer_id, producer_epoch));
+        }
+
+        drop(c);
+
+        for (transaction_id, producer_id, producer_epoch) in expired {
+            match self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                Ok(ErrorCode::None) => {}
+                Ok(error_code) => tracing::warn!(
+                    ?error_code,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "timed-out transaction abort rejected"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "aborting timed-out transaction failed"
+                ),
+            }
+        }
+
+        Ok(())
+    }
+
     async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {
         if let Some((base, key)) = topic.split_once('/')
             && self
@@ -3658,8 +3706,10 @@ impl Storage for Postgres {
         Ok(())
     }
 
+    /// Abort transactions whose timeout has elapsed. Runs on the broker's
+    /// maintenance interval, split out of [`Postgres::maintain`].
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
-        Ok(())
+        self.abort_timed_out_transactions().await
     }
 
     async fn delete_user_scram_credential(
@@ -3779,3 +3829,170 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("The SQL error count")
         .build()
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BrokerRegistrationRequest;
+    use rand::distr::Alphanumeric;
+    use tansu_sans_io::{
+        add_partitions_to_txn_request::AddPartitionsToTxnTopic, record::inflated::Batch,
+    };
+
+    // mirrors tansu-broker/tests/common/mod.rs storage_container(StorageType::Postgres)
+    const CONNECTION: &str = "postgres://postgres:postgres@localhost";
+
+    fn alphanumeric_string(length: usize) -> String {
+        rng()
+            .sample_iter(&Alphanumeric)
+            .take(length)
+            .map(char::from)
+            .collect()
+    }
+
+    // A transactional producer that begins a transaction and then dies (never
+    // commits or aborts) leaves the txn in BEGIN forever, pinning the last stable
+    // offset and head-of-line blocking every read_committed consumer.
+    // `maintain_transactions` must abort any BEGIN transaction whose started_at +
+    // transaction_timeout_ms has passed.
+    #[tokio::test]
+    async fn maintain_transactions_aborts_timed_out_begin_transaction() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        // Probe connectivity explicitly: only a genuinely unreachable postgres
+        // should skip. Any later schema/query error must fail the test.
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintain_transactions_aborts_timed_out_begin_transaction: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+        let transaction_timeout_ms = 10_000;
+
+        // initialise the transactional producer
+        let producer = storage
+            .init_producer(
+                Some(transaction_id.as_str()),
+                transaction_timeout_ms,
+                Some(-1),
+                Some(-1),
+            )
+            .await?;
+
+        // add a partition to the transaction (this starts the txn timer / BEGIN)
+        let response = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+        assert_eq!(1, response.zero_to_three().len());
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // produce an uncommitted record inside the transaction
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"uncommitted").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // sanity: the transaction is in BEGIN before maintenance runs
+        let status_before = txn_status(&storage, &cluster, &transaction_id, &producer).await?;
+        assert_eq!(Some(String::from(TxnState::Begin)), status_before);
+
+        // the producer "dies": move started_at well into the past so the
+        // transaction is unambiguously past its transaction_timeout_ms
+        let c = storage.connection().await?;
+        let updated = c
+            .execute(
+                "update txn_detail set started_at = current_timestamp - interval '1 hour' \
+                 from txn join cluster c on c.id = txn.cluster \
+                 where txn_detail.\"transaction\" = txn.id \
+                 and c.name = $1 and txn.name = $2",
+                &[&cluster, &transaction_id],
+            )
+            .await?;
+        assert_eq!(1, updated);
+
+        // run transaction maintenance: the timed-out BEGIN transaction must be aborted
+        storage.maintain_transactions(SystemTime::now()).await?;
+
+        let status_after = txn_status(&storage, &cluster, &transaction_id, &producer).await?;
+        assert_eq!(Some(String::from(TxnState::Aborted)), status_after);
+
+        Ok(())
+    }
+
+    async fn txn_status(
+        storage: &Postgres,
+        cluster: &str,
+        transaction_id: &str,
+        producer: &ProducerIdResponse,
+    ) -> Result<Option<String>> {
+        let c = storage.connection().await?;
+
+        let row = c
+            .query_one(
+                "select txn_d.status \
+                 from cluster c \
+                 join producer p on p.cluster = c.id \
+                 join producer_epoch pe on pe.producer = p.id \
+                 join txn on txn.cluster = c.id and txn.producer = p.id \
+                 join txn_detail txn_d on txn_d.\"transaction\" = txn.id \
+                 and txn_d.producer_epoch = pe.id \
+                 where c.name = $1 and txn.name = $2 and p.id = $3 and pe.epoch = $4",
+                &[
+                    &cluster.to_owned(),
+                    &transaction_id.to_owned(),
+                    &producer.id,
+                    &producer.epoch,
+                ],
+            )
+            .await?;
+
+        row.try_get::<_, Option<String>>(0).map_err(Into::into)
+    }
+}
