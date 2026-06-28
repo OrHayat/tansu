@@ -3693,10 +3693,6 @@ impl Storage for Postgres {
 
     #[instrument(skip_all)]
     async fn maintain(&self, now: SystemTime) -> Result<()> {
-        if let Err(err) = self.abort_timed_out_transactions().await {
-            tracing::warn!(?err, "aborting timed-out transactions failed");
-        }
-
         let deleted = self.policy_delete(now).await?;
         debug!(deleted);
 
@@ -3708,6 +3704,12 @@ impl Storage for Postgres {
         }
 
         Ok(())
+    }
+
+    /// Abort transactions whose timeout has elapsed. Runs on the broker's
+    /// maintenance interval, split out of [`Postgres::maintain`].
+    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+        self.abort_timed_out_transactions().await
     }
 
     async fn delete_user_scram_credential(
@@ -3850,11 +3852,11 @@ mod tests {
 
     // A transactional producer that begins a transaction and then dies (never
     // commits or aborts) leaves the txn in BEGIN forever, pinning the last stable
-    // offset and head-of-line blocking every read_committed consumer. `maintain`
-    // must abort any BEGIN transaction whose started_at + transaction_timeout_ms
-    // has passed.
+    // offset and head-of-line blocking every read_committed consumer.
+    // `maintain_transactions` must abort any BEGIN transaction whose started_at +
+    // transaction_timeout_ms has passed.
     #[tokio::test]
-    async fn maintain_aborts_timed_out_begin_transaction() -> Result<()> {
+    async fn maintain_transactions_aborts_timed_out_begin_transaction() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
         let storage = Postgres::builder(CONNECTION)?
@@ -3865,7 +3867,7 @@ mod tests {
         // Probe connectivity explicitly: only a genuinely unreachable postgres
         // should skip. Any later schema/query error must fail the test.
         if let Err(err) = storage.connection().await {
-            eprintln!("skipping maintain_aborts_timed_out_begin_transaction: {err:?}");
+            eprintln!("skipping maintain_transactions_aborts_timed_out_begin_transaction: {err:?}");
             return Ok(());
         }
 
@@ -3955,8 +3957,8 @@ mod tests {
             .await?;
         assert_eq!(1, updated);
 
-        // run maintenance: the timed-out BEGIN transaction must be aborted
-        storage.maintain(SystemTime::now()).await?;
+        // run transaction maintenance: the timed-out BEGIN transaction must be aborted
+        storage.maintain_transactions(SystemTime::now()).await?;
 
         let status_after = txn_status(&storage, &cluster, &transaction_id, &producer).await?;
         assert_eq!(Some(String::from(TxnState::Aborted)), status_after);

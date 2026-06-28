@@ -1519,6 +1519,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Abort transactions whose timeout has elapsed, releasing the Last
+    /// Stable Offset they pin. Split out of [`Storage::maintain`] so it can
+    /// run on its own cadence. The default is a no-op; a backend overrides it
+    /// to perform the sweep.
+    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+        Ok(())
+    }
+
     async fn cluster_id(&self) -> Result<String>;
 
     async fn node(&self) -> Result<i32>;
@@ -1768,6 +1776,10 @@ where
 
     async fn maintain(&self, now: SystemTime) -> Result<()> {
         self.as_ref().maintain(now).await
+    }
+
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        self.as_ref().maintain_transactions(now).await
     }
 
     async fn cluster_id(&self) -> Result<String> {
@@ -2023,6 +2035,10 @@ where
 
     async fn maintain(&self, now: SystemTime) -> Result<()> {
         self.as_ref().maintain(now).await
+    }
+
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        self.as_ref().maintain_transactions(now).await
     }
 
     async fn cluster_id(&self) -> Result<String> {
@@ -3550,6 +3566,27 @@ impl Storage for StorageContainer {
             debug!(?err);
             STORAGE_CONTAINER_ERRORS.add(1, &attributes);
         })
+    }
+
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.maintain_transactions(now).await,
+
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.maintain_transactions(now).await,
+
+            Self::Null(engine) => engine.maintain_transactions(now).await,
+
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.maintain_transactions(now).await,
+
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.maintain_transactions(now).await,
+
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.maintain_transactions(now).await,
+        }
     }
 
     #[instrument(skip_all)]

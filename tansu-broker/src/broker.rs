@@ -339,7 +339,9 @@ where
                         let span = span!(Level::DEBUG, "maintenance");
 
                         async move {
-                            _ = storage.maintain(SystemTime::now()).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
+                            let now = SystemTime::now();
+                            _ = storage.maintain(now).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
+                            _ = storage.maintain_transactions(now).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
 
                         }.instrument(span).await
 
