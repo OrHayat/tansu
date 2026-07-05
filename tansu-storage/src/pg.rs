@@ -4069,4 +4069,354 @@ mod tests {
 
         Ok(())
     }
+
+    /// A transaction that hasn't reached its own `transaction_timeout_ms` yet must be left
+    /// alone by the sweep -- it should not be aborted just because maintain_transactions ran.
+    #[tokio::test]
+    async fn maintain_transactions_leaves_transaction_before_timeout() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintain_transactions_leaves_transaction_before_timeout: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"still-active").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        let before = storage.offset_stage(&topition).await?;
+
+        // `now` is barely past `started_at`, nowhere near the 10s timeout.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_millis(50))
+            .await?;
+
+        let after = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            before.last_stable, after.last_stable,
+            "a transaction within its timeout must not be touched by the sweep \
+             (before={}, after={})",
+            before.last_stable, after.last_stable,
+        );
+        assert!(
+            after.last_stable < after.high_watermark,
+            "the still-open transaction must remain pinned \
+             (last_stable={}, high_watermark={})",
+            after.last_stable,
+            after.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// When a timed-out transaction overlaps an older, still-open transaction on the same
+    /// partition, the sweep must not finalize it out of order: it should stage to
+    /// PREPARE_ABORT and leave the last stable offset exactly where the older transaction
+    /// pins it, until that older transaction resolves too.
+    #[tokio::test]
+    async fn maintain_transactions_defers_when_older_overlapping_transaction_still_open()
+    -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping maintain_transactions_defers_when_older_overlapping_transaction_still_open: {err:?}"
+            );
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // producer A: opens first, given a long timeout, and never resolves -- it's the
+        // oldest open transaction on this partition, so it pins the last stable offset.
+        let txn_a = alphanumeric_string(10);
+        let producer_a = storage
+            .init_producer(Some(txn_a.as_str()), 10_000_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_a.clone(),
+                producer_id: producer_a.id,
+                producer_epoch: producer_a.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_a = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"a").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_a.id)
+            .producer_epoch(producer_a.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_a.as_str()), &topition, batch_a)
+            .await?;
+
+        // producer B: opens second, on the same partition, with a short timeout -- it will
+        // be picked up by the sweep, but must defer to A.
+        let txn_b = alphanumeric_string(10);
+        let producer_b = storage
+            .init_producer(Some(txn_b.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_b.clone(),
+                producer_id: producer_b.id,
+                producer_epoch: producer_b.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_b = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"b").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_b.id)
+            .producer_epoch(producer_b.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_b.as_str()), &topition, batch_b)
+            .await?;
+
+        let before = storage.offset_stage(&topition).await?;
+
+        // far enough ahead for B's 10s timeout to have elapsed, nowhere near A's ~10,000s one.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(20))
+            .await?;
+
+        let after = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            before.last_stable, after.last_stable,
+            "B must not advance last_stable while A (older, still open) remains pinned \
+             (before={}, after={})",
+            before.last_stable, after.last_stable,
+        );
+        assert!(
+            after.last_stable < after.high_watermark,
+            "A is still open, so last_stable must remain pinned below the high watermark \
+             (last_stable={}, high_watermark={})",
+            after.last_stable,
+            after.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// The status guard added to end_in_tx must make a second, stale call safely idempotent --
+    /// this is the exact race maintain_transactions and a genuinely concurrent client EndTxn
+    /// could hit: a candidate found by the sweep's query that a real client finalizes first.
+    #[tokio::test]
+    async fn txn_end_after_already_finalized_is_a_no_op() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_end_after_already_finalized_is_a_no_op: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"raced").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // the "real client" wins the race and commits first.
+        _ = storage
+            .txn_end(&transaction_id, producer.id, producer.epoch, true)
+            .await?;
+
+        let after_commit = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            after_commit.last_stable, after_commit.high_watermark,
+            "the committed transaction should have released last_stable \
+             (last_stable={}, high_watermark={})",
+            after_commit.last_stable, after_commit.high_watermark,
+        );
+
+        // the sweep's stale view still thinks it should abort the same transaction.
+        let error_code = storage
+            .txn_end(&transaction_id, producer.id, producer.epoch, false)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            error_code,
+            "a duplicate txn_end on an already-finalized transaction must be a no-op, \
+             not an error"
+        );
+
+        let after_duplicate = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            after_commit.high_watermark, after_duplicate.high_watermark,
+            "the duplicate call must not append a second control-batch marker \
+             (high_watermark before={}, after={})",
+            after_commit.high_watermark, after_duplicate.high_watermark,
+        );
+
+        Ok(())
+    }
 }
