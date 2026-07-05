@@ -1000,6 +1000,42 @@ impl Postgres {
     ) -> Result<ErrorCode> {
         debug!(cluster = ?self.cluster, ?transaction_id, ?producer_id, ?producer_epoch, ?committed);
 
+        // Lock the row before touching anything else: if a concurrent caller (a real
+        // EndTxn racing the maintain_transactions sweep, or a retried EndTxn) already
+        // finalized this transaction, this blocks until it commits, then sees the
+        // terminal status below and no-ops instead of writing a second marker.
+        let status = match self
+            .tx_prepare_query_opt(
+                tx,
+                "txn_detail_select_status_for_update.sql",
+                &[
+                    &self.cluster,
+                    &transaction_id,
+                    &producer_id,
+                    &producer_epoch,
+                ],
+            )
+            .await?
+        {
+            Some(row) => row
+                .try_get::<_, Option<String>>(0)? // nullable transaction status column -> Option<String>
+                .map(TxnState::try_from) // parse if present -> Option<Result<TxnState, _>>
+                .transpose()?, // Option<Result<_>> -> Result<Option<_>>, then `?` -> Option<TxnState>
+            None => None, // no txn_detail row found
+        };
+
+        // idempotent no-op: someone else already committed or aborted this transaction
+        if matches!(status, Some(TxnState::Committed) | Some(TxnState::Aborted)) {
+            debug!(
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                ?status,
+                "already finalized"
+            );
+            return Ok(ErrorCode::None);
+        }
+
         let mut overlaps = vec![];
 
         let rows = self
@@ -3658,7 +3694,34 @@ impl Storage for Postgres {
         Ok(())
     }
 
-    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+    #[instrument(skip(self), ret)]
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        let c = self.connection().await?;
+
+        let rows = self
+            .prepare_query(
+                &c,
+                "txn_detail_select_timed_out.sql",
+                &[&self.cluster, &now],
+            )
+            .await?;
+
+        for row in rows {
+            let transaction_id = row.try_get::<_, String>(0)?;
+            let producer_id = row.try_get::<_, i64>(1)?;
+            let producer_epoch = row.try_get::<_, i16>(2)?;
+
+            if let Err(ref err) = self
+                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .await
+            {
+                error!(
+                    ?err,
+                    transaction_id, producer_id, producer_epoch, "maintain_transactions"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -3889,6 +3952,109 @@ mod tests {
              (last_stable={}, high_watermark={})",
             stage.last_stable,
             stage.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// A transaction whose timeout has elapsed without the client calling `EndTxn` (a crashed
+    /// or abandoned producer) must be aborted by `maintain_transactions`, releasing the
+    /// `read_committed` last stable offset it was pinning.
+    #[tokio::test]
+    async fn maintain_transactions_aborts_timed_out_transaction() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintain_transactions_aborts_timed_out_transaction: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // a transactional producer begins a transaction and produces, never commits
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"abandoned").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        let stage = storage.offset_stage(&topition).await?;
+
+        assert!(
+            stage.last_stable < stage.high_watermark,
+            "an open transaction must pin last_stable below the high watermark \
+             (last_stable={}, high_watermark={})",
+            stage.last_stable,
+            stage.high_watermark,
+        );
+
+        // no need to actually sleep past the timeout: `now` is a plain parameter,
+        // so pass a `now` far enough ahead that the 10s timeout has "elapsed".
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let stage = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            stage.high_watermark, stage.last_stable,
+            "the timed-out transaction should have been aborted, releasing last_stable \
+             (last_stable={}, high_watermark={})",
+            stage.last_stable, stage.high_watermark,
         );
 
         Ok(())
