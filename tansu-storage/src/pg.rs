@@ -37,7 +37,7 @@ use tansu_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
     add_partitions_to_txn_response::{
-        AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
+        AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult,
     },
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
@@ -3527,8 +3527,48 @@ impl Storage for Postgres {
                 Ok(TxnAddPartitionsResponse::VersionZeroToThree(results))
             }
 
-            TxnAddPartitionsRequest::VersionFourPlus { .. } => {
-                todo!()
+            TxnAddPartitionsRequest::VersionFourPlus { transactions } => {
+                // Full v4+ semantics (batching multiple transactions per request, and
+                // VerifyOnly's distinct check-without-adding behavior, KIP-890) aren't
+                // implemented yet. Guessing at VerifyOnly would risk silently treating a
+                // check-only request as a real add -- a correctness bug, not just a missing
+                // feature -- so report every partition in the request as UnsupportedVersion
+                // instead: a real v4+ client gets a clean, well-formed error rather than a
+                // dropped connection.
+                let results = transactions
+                    .into_iter()
+                    .map(|transaction| {
+                        let topic_results = transaction
+                            .topics
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|topic| {
+                                let results_by_partition = topic
+                                    .partitions
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|partition_index| {
+                                        AddPartitionsToTxnPartitionResult::default()
+                                            .partition_index(partition_index)
+                                            .partition_error_code(i16::from(
+                                                ErrorCode::UnsupportedVersion,
+                                            ))
+                                    })
+                                    .collect();
+
+                                AddPartitionsToTxnTopicResult::default()
+                                    .name(topic.name)
+                                    .results_by_partition(Some(results_by_partition))
+                            })
+                            .collect();
+
+                        AddPartitionsToTxnResult::default()
+                            .transactional_id(transaction.transactional_id)
+                            .topic_results(Some(topic_results))
+                    })
+                    .collect();
+
+                Ok(TxnAddPartitionsResponse::VersionFourPlus(results))
             }
         }
     }
@@ -3847,7 +3887,9 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 mod tests {
     use super::*;
     use rand::distr::Alphanumeric;
-    use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use tansu_sans_io::add_partitions_to_txn_request::{
+        AddPartitionsToTxnTopic, AddPartitionsToTxnTransaction,
+    };
 
     // mirrors tansu-broker/tests/common/mod.rs storage_container(StorageType::Postgres)
     const CONNECTION: &str = "postgres://postgres:postgres@localhost";
@@ -4405,6 +4447,69 @@ mod tests {
             "the duplicate call must not append a second control-batch marker \
              (high_watermark before={}, after={})",
             after_commit.high_watermark, after_duplicate.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// AddPartitionsToTxn v4+ (batched transactions, KIP-890) isn't implemented -- it must
+    /// return a well-formed UnsupportedVersion response, not panic.
+    #[tokio::test]
+    async fn txn_add_partitions_version_four_plus_is_unsupported_not_a_panic() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping txn_add_partitions_version_four_plus_is_unsupported_not_a_panic: {err:?}"
+            );
+            return Ok(());
+        }
+
+        let transaction_id = alphanumeric_string(10);
+        let topic_name = alphanumeric_string(15);
+
+        let response = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionFourPlus {
+                transactions: vec![
+                    AddPartitionsToTxnTransaction::default()
+                        .transactional_id(transaction_id.clone())
+                        .producer_id(1)
+                        .producer_epoch(0)
+                        .verify_only(false)
+                        .topics(Some(
+                            [AddPartitionsToTxnTopic::default()
+                                .name(topic_name.clone())
+                                .partitions(Some([0].into()))]
+                            .into(),
+                        )),
+                ],
+            })
+            .await?;
+
+        let TxnAddPartitionsResponse::VersionFourPlus(results) = response else {
+            panic!("expected a VersionFourPlus response, got {response:?}");
+        };
+
+        assert_eq!(1, results.len());
+        assert_eq!(transaction_id, results[0].transactional_id);
+
+        let topic_results = results[0].topic_results.clone().unwrap_or_default();
+        assert_eq!(1, topic_results.len());
+        assert_eq!(topic_name, topic_results[0].name);
+
+        let partition_results = topic_results[0]
+            .results_by_partition
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(1, partition_results.len());
+        assert_eq!(
+            i16::from(ErrorCode::UnsupportedVersion),
+            partition_results[0].partition_error_code,
         );
 
         Ok(())
