@@ -334,7 +334,14 @@ create table if not exists txn_detail (
     -- AddPartitionsToTxnRequest:
     -- If this is the first partition added to the transaction,
     -- the coordinator will also start the transaction timer
-    started_at timestamp,
+    --
+    -- timestamptz, not timestamp: this is compared against a Rust SystemTime (an absolute
+    -- instant) to detect timeouts. A bare `timestamp` stores current_timestamp's wall-clock
+    -- reading in whatever the session's TimeZone happens to be, with the zone itself
+    -- discarded -- on a non-UTC server that silently desyncs the comparison from real
+    -- elapsed time (by the server's UTC offset, in either direction). timestamptz stores the
+    -- actual instant, so the comparison is correct regardless of session timezone.
+    started_at timestamptz,
     -- BEGIN, PREPARE_COMMIT, PREPARE_ABORT, COMMITTED or ABORTED
     --
     status text,

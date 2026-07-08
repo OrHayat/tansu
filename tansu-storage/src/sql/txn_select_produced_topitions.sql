@@ -35,4 +35,12 @@ where
 c.name = $1
 and txn.name = $2
 and p.id = $3
-and pe.epoch = $4;
+and pe.epoch = $4
+
+-- Deterministic order is required, not cosmetic: end_in_tx's caller takes a per-partition
+-- row lock (watermark FOR NO KEY UPDATE, via produce_in_tx) for each row this query
+-- returns, held for the rest of that DB transaction. Two transactions touching the same
+-- partitions, added via AddPartitionsToTxn in different orders, finalizing concurrently,
+-- would otherwise be free to acquire those locks in opposite order and deadlock. Ordering
+-- every caller's lock acquisition the same way (topic name, then partition) rules that out.
+order by t.name, tp.partition;
