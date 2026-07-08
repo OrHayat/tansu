@@ -13,7 +13,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare txn_detail_select_timed_out (text, timestamp) as
+-- prepare txn_detail_select_timed_out (text, timestamptz) as
 
 select txn.name, p.id, pe.epoch
 
@@ -29,6 +29,9 @@ where
 
 c.name = $1
 and txn_d.status = 'BEGIN'
+and txn_d.transaction_timeout_ms > 0 -- 0 means "no timeout", never expire it
 and txn_d.started_at is not null
-and (extract(epoch from cast($2 as timestamp)) - extract(epoch from txn_d.started_at)) * 1000
+-- $2 (a Rust SystemTime) and started_at (timestamptz) are both absolute instants here, so
+-- extract(epoch from ...) gives true elapsed seconds regardless of the session's TimeZone.
+and (extract(epoch from cast($2 as timestamptz)) - extract(epoch from txn_d.started_at)) * 1000
     > txn_d.transaction_timeout_ms;

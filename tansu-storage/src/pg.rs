@@ -1025,17 +1025,50 @@ impl Postgres {
             None => None, // no txn_detail row found
         };
 
-        // idempotent no-op: someone else already committed or aborted this transaction
-        if matches!(status, Some(TxnState::Committed) | Some(TxnState::Aborted)) {
-            debug!(
-                transaction_id,
-                producer_id,
-                producer_epoch,
-                ?status,
-                "already finalized"
-            );
-            return Ok(ErrorCode::None);
-        }
+        // Outcome-aware idempotency: a retry (or a race between a real EndTxn and the sweep)
+        // must only no-op when it agrees with what's already staged or finalized for this
+        // transaction. A conflicting request -- e.g. a real commit arriving after the sweep
+        // already staged/finalized an abort -- is a genuine protocol error (InvalidTxnState is
+        // exactly Kafka's error code for "transactional operation attempted in an invalid
+        // state"), not something to silently paper over by claiming success either way.
+        //
+        // PREPARE_COMMIT/PREPARE_ABORT means an earlier call already wrote this transaction's
+        // control marker and is only waiting on an older, still-open transaction on the same
+        // partition(s) to resolve first -- so a matching retry must NOT write a second marker,
+        // it should just re-check whether those older transactions have since resolved.
+        let write_marker = match status {
+            Some(TxnState::Committed) => {
+                debug!(transaction_id, producer_id, producer_epoch, ?status);
+                return Ok(if committed {
+                    ErrorCode::None
+                } else {
+                    ErrorCode::InvalidTxnState
+                });
+            }
+            Some(TxnState::Aborted) => {
+                debug!(transaction_id, producer_id, producer_epoch, ?status);
+                return Ok(if committed {
+                    ErrorCode::InvalidTxnState
+                } else {
+                    ErrorCode::None
+                });
+            }
+            Some(TxnState::PrepareCommit) => {
+                if !committed {
+                    debug!(transaction_id, producer_id, producer_epoch, ?status);
+                    return Ok(ErrorCode::InvalidTxnState);
+                }
+                false
+            }
+            Some(TxnState::PrepareAbort) => {
+                if committed {
+                    debug!(transaction_id, producer_id, producer_epoch, ?status);
+                    return Ok(ErrorCode::InvalidTxnState);
+                }
+                false
+            }
+            None | Some(TxnState::Begin) => true,
+        };
 
         let mut overlaps = vec![];
 
@@ -1060,37 +1093,42 @@ impl Postgres {
 
             debug!(?topition);
 
-            let control_batch: Bytes = if committed {
-                ControlBatch::default().commit().try_into()?
-            } else {
-                ControlBatch::default().abort().try_into()?
-            };
-            let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
+            // Only write the control marker the first time this transaction is finalized or
+            // deferred -- a matching retry while already staged in PREPARE_COMMIT/
+            // PREPARE_ABORT must not write a second one (see the status match above).
+            if write_marker {
+                let control_batch: Bytes = if committed {
+                    ControlBatch::default().commit().try_into()?
+                } else {
+                    ControlBatch::default().abort().try_into()?
+                };
+                let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
 
-            let batch = Batch::builder()
-                .record(
-                    Record::builder()
-                        .key(control_batch.into())
-                        .value(end_transaction_marker.into()),
-                )
-                .attributes(
-                    BatchAttribute::default()
-                        .control(true)
-                        .transaction(true)
-                        .into(),
-                )
-                .producer_id(producer_id)
-                .producer_epoch(producer_epoch)
-                .base_sequence(-1)
-                .build()
-                .and_then(TryInto::try_into)
-                .inspect(|deflated| debug!(?deflated))?;
+                let batch = Batch::builder()
+                    .record(
+                        Record::builder()
+                            .key(control_batch.into())
+                            .value(end_transaction_marker.into()),
+                    )
+                    .attributes(
+                        BatchAttribute::default()
+                            .control(true)
+                            .transaction(true)
+                            .into(),
+                    )
+                    .producer_id(producer_id)
+                    .producer_epoch(producer_epoch)
+                    .base_sequence(-1)
+                    .build()
+                    .and_then(TryInto::try_into)
+                    .inspect(|deflated| debug!(?deflated))?;
 
-            let offset = self
-                .produce_in_tx(Some(transaction_id), &topition, batch, tx)
-                .await?;
+                let offset = self
+                    .produce_in_tx(Some(transaction_id), &topition, batch, tx)
+                    .await?;
 
-            debug!(offset, ?topition);
+                debug!(offset, ?topition);
+            }
 
             let row = self
                 .tx_prepare_query_one(
@@ -3764,19 +3802,35 @@ impl Storage for Postgres {
             )
             .await?;
 
+        // release the listing connection before aborting: each txn_end below checks
+        // out its own connection from the same pool, and the pool can be small
+        // (or exactly 1), so holding this one idle risks starving/deadlocking them.
+        drop(c);
+
         for row in rows {
             let transaction_id = row.try_get::<_, String>(0)?;
             let producer_id = row.try_get::<_, i64>(1)?;
             let producer_epoch = row.try_get::<_, i16>(2)?;
 
-            if let Err(ref err) = self
+            match self
                 .txn_end(&transaction_id, producer_id, producer_epoch, false)
                 .await
             {
-                error!(
+                Ok(ErrorCode::None) => {}
+                // Benign, expected outcome: the sweep lost a race against a real client that
+                // already finalized this transaction between the SELECT above and this call.
+                // Not an operational problem, so debug! rather than error!.
+                Ok(error_code) => debug!(
+                    ?error_code,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "maintain_transactions: abort rejected"
+                ),
+                Err(ref err) => error!(
                     ?err,
                     transaction_id, producer_id, producer_epoch, "maintain_transactions"
-                );
+                ),
             }
         }
 
@@ -4356,11 +4410,14 @@ mod tests {
         Ok(())
     }
 
-    /// The status guard added to end_in_tx must make a second, stale call safely idempotent --
-    /// this is the exact race maintain_transactions and a genuinely concurrent client EndTxn
-    /// could hit: a candidate found by the sweep's query that a real client finalizes first.
+    /// The status guard added to end_in_tx must reject a second, stale call that conflicts
+    /// with what already happened -- this is the exact race maintain_transactions and a
+    /// genuinely concurrent client EndTxn could hit: a candidate found by the sweep's query
+    /// that a real client commits first, then the sweep's stale abort arrives late. The guard
+    /// must not silently ack the sweep's abort as success (that would tell the caller their
+    /// request "worked" when the transaction was actually already committed).
     #[tokio::test]
-    async fn txn_end_after_already_finalized_is_a_no_op() -> Result<()> {
+    async fn txn_end_after_already_finalized_with_conflicting_outcome_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
         let storage = Postgres::builder(CONNECTION)?
@@ -4444,25 +4501,451 @@ mod tests {
             after_commit.last_stable, after_commit.high_watermark,
         );
 
-        // the sweep's stale view still thinks it should abort the same transaction.
+        // the sweep's stale view still thinks it should abort the same transaction -- but the
+        // real client already committed it. This must be rejected, not silently acked.
         let error_code = storage
             .txn_end(&transaction_id, producer.id, producer.epoch, false)
             .await?;
 
         assert_eq!(
-            ErrorCode::None,
+            ErrorCode::InvalidTxnState,
             error_code,
-            "a duplicate txn_end on an already-finalized transaction must be a no-op, \
-             not an error"
+            "a stale abort arriving after a real commit must be rejected, not acked as \
+             success -- the caller has no other way to learn their request didn't apply"
         );
 
-        let after_duplicate = storage.offset_stage(&topition).await?;
+        let after_conflict = storage.offset_stage(&topition).await?;
 
         assert_eq!(
-            after_commit.high_watermark, after_duplicate.high_watermark,
-            "the duplicate call must not append a second control-batch marker \
+            after_commit.high_watermark, after_conflict.high_watermark,
+            "the rejected call must not append a second control-batch marker \
              (high_watermark before={}, after={})",
-            after_commit.high_watermark, after_duplicate.high_watermark,
+            after_commit.high_watermark, after_conflict.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// A retry (or a genuine race between a real EndTxn and the sweep) that lands while a
+    /// transaction is deferred (PREPARE_ABORT/PREPARE_COMMIT -- an older, still-open
+    /// transaction on the same partition hasn't resolved yet) must not write a second control
+    /// marker. Deferral means the marker was already written on the first call; only the
+    /// overlap check should re-run.
+    #[tokio::test]
+    async fn deferred_txn_end_retry_does_not_duplicate_marker() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping deferred_txn_end_retry_does_not_duplicate_marker: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // producer A: opens first, never resolves -- pins B behind it.
+        let txn_a = alphanumeric_string(10);
+        let producer_a = storage
+            .init_producer(Some(txn_a.as_str()), 10_000_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_a.clone(),
+                producer_id: producer_a.id,
+                producer_epoch: producer_a.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_a = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"a").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_a.id)
+            .producer_epoch(producer_a.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_a.as_str()), &topition, batch_a)
+            .await?;
+
+        // producer B: opens second, overlapping A -- must defer.
+        let txn_b = alphanumeric_string(10);
+        let producer_b = storage
+            .init_producer(Some(txn_b.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_b.clone(),
+                producer_id: producer_b.id,
+                producer_epoch: producer_b.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_b = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"b").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_b.id)
+            .producer_epoch(producer_b.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_b.as_str()), &topition, batch_b)
+            .await?;
+
+        // first call: B defers (A is still open), writing its abort marker but only reaching
+        // PREPARE_ABORT, not the terminal ABORTED the guard checks for.
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&txn_b, producer_b.id, producer_b.epoch, false)
+                .await?
+        );
+
+        // second call: simulates a retry, or the sweep racing a real client's EndTxn, while B
+        // is still sitting in PREPARE_ABORT. The guard should recognize this as already
+        // handled and no-op -- if it doesn't, a second marker gets written.
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&txn_b, producer_b.id, producer_b.epoch, false)
+                .await?
+        );
+
+        // Two calls while deferred must still result in exactly one control-batch marker
+        // record for producer B on this partition -- a real Kafka client seeing two
+        // conflicting markers for the same producer is undefined/nonsensical behavior. Counted
+        // directly against the record table (aborted_transactions isn't wired up yet at this
+        // point in the stack).
+        let c = storage.connection().await?;
+        let marker_count: i64 = c
+            .query_one(
+                "select count(*) from cluster c \
+                 join topic t on t.cluster = c.id \
+                 join topition tp on tp.topic = t.id \
+                 join record r on r.topition = tp.id \
+                 where c.name = $1 and t.name = $2 and tp.partition = $3 \
+                 and r.producer_id = $4 and (r.attributes & 32) = 32",
+                &[&cluster, &topic_name, &0i32, &producer_b.id],
+            )
+            .await?
+            .try_get(0)?;
+
+        assert_eq!(
+            1, marker_count,
+            "expected exactly one control-batch marker for producer B, got {marker_count}",
+        );
+
+        Ok(())
+    }
+
+    /// Once maintain_transactions sweep-aborts a timed-out transaction, a LATE real
+    /// EndTxn(commit=true) for that same transaction (e.g. a slow producer that was declared
+    /// dead but is actually still alive and finally calls commit) must be rejected, not acked
+    /// as success -- the data was already irreversibly reported as aborted, so telling the
+    /// caller their commit "worked" would be a lie.
+    #[tokio::test]
+    async fn late_commit_after_sweep_abort_is_rejected() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping late_commit_after_sweep_abort_is_rejected: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"slow-producer").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // the sweep declares this transaction dead and aborts it.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let stage = storage.offset_stage(&topition).await?;
+        assert_eq!(
+            stage.high_watermark, stage.last_stable,
+            "the sweep should have aborted the timed-out transaction"
+        );
+
+        // the "slow" producer, unaware it's been declared dead, finally calls commit for real.
+        let late_commit_result = storage
+            .txn_end(&transaction_id, producer.id, producer.epoch, true)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::InvalidTxnState,
+            late_commit_result,
+            "a late commit() after a sweep-abort must be rejected, not acked as success -- \
+             the caller has no other way to learn their commit didn't apply",
+        );
+
+        Ok(())
+    }
+
+    async fn txn_status(
+        storage: &Postgres,
+        cluster: &str,
+        transaction_id: &str,
+        producer: &ProducerIdResponse,
+    ) -> Result<Option<String>> {
+        let c = storage.connection().await?;
+
+        let row = c
+            .query_one(
+                "select txn_d.status \
+                 from cluster c \
+                 join producer p on p.cluster = c.id \
+                 join producer_epoch pe on pe.producer = p.id \
+                 join txn on txn.cluster = c.id and txn.producer = p.id \
+                 join txn_detail txn_d on txn_d.\"transaction\" = txn.id \
+                 and txn_d.producer_epoch = pe.id \
+                 where c.name = $1 and txn.name = $2 and p.id = $3 and pe.epoch = $4",
+                &[
+                    &cluster.to_owned(),
+                    &transaction_id.to_owned(),
+                    &producer.id,
+                    &producer.epoch,
+                ],
+            )
+            .await?;
+
+        row.try_get::<_, Option<String>>(0).map_err(Into::into)
+    }
+
+    /// Stress the race end_in_tx's status guard exists to close: a genuinely concurrent
+    /// live commit (as a real client's EndTxn) and the maintain_transactions sweep's abort,
+    /// both racing txn_end on the exact same transaction. Recovered and adapted from an
+    /// earlier, unmerged exploration (orhayat/fix/pg-txn-timeout-abort) that found this race
+    /// before the guard existed; run here to confirm the guard actually holds under real
+    /// concurrency, not just the sequential simulation above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn race_concurrent_commit_and_abort() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping race_concurrent_commit_and_abort: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let iterations = 100;
+        let mut commit_wins = 0;
+        let mut abort_wins = 0;
+        let mut both_ok = 0;
+        let mut both_err = 0;
+        let mut anomalies: Vec<String> = vec![];
+
+        for i in 0..iterations {
+            let transaction_id = alphanumeric_string(10);
+
+            let producer = storage
+                .init_producer(Some(transaction_id.as_str()), 60_000, Some(-1), Some(-1))
+                .await?;
+
+            _ = storage
+                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                    transaction_id: transaction_id.clone(),
+                    producer_id: producer.id,
+                    producer_epoch: producer.epoch,
+                    topics: vec![
+                        AddPartitionsToTxnTopic::default()
+                            .name(topic_name.clone())
+                            .partitions(Some((0..num_partitions).collect())),
+                    ],
+                })
+                .await?;
+
+            let batch = Batch::builder()
+                .record(Record::builder().value(Bytes::from_static(b"v").into()))
+                .attributes(BatchAttribute::default().transaction(true).into())
+                .producer_id(producer.id)
+                .producer_epoch(producer.epoch)
+                .base_sequence(0)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = storage
+                .produce(Some(transaction_id.as_str()), &topition, batch)
+                .await?;
+
+            let wm_before = storage.offset_stage(&topition).await?.high_watermark;
+
+            let (s1, s2) = (storage.clone(), storage.clone());
+            let (t1, t2) = (transaction_id.clone(), transaction_id.clone());
+            let (pid, ep) = (producer.id, producer.epoch);
+
+            let commit = tokio::spawn(async move { s1.txn_end(&t1, pid, ep, true).await });
+            let abort = tokio::spawn(async move { s2.txn_end(&t2, pid, ep, false).await });
+
+            let r_commit = commit.await.expect("commit task panicked");
+            let r_abort = abort.await.expect("abort task panicked");
+
+            let wm_after = storage.offset_stage(&topition).await?.high_watermark;
+            let markers = wm_after - wm_before;
+            let status = txn_status(&storage, &cluster, &transaction_id, &producer).await?;
+
+            match (r_commit.is_ok(), r_abort.is_ok()) {
+                (true, false) => commit_wins += 1,
+                (false, true) => abort_wins += 1,
+                (true, true) => both_ok += 1,
+                (false, false) => both_err += 1,
+            }
+
+            // The end_in_tx status guard makes the loser of the race a clean
+            // Ok(ErrorCode::None) no-op too (matching how Kafka treats a duplicate
+            // EndTxn), so both calls returning Ok is expected -- it no longer signals
+            // which side "won". The real invariants: exactly one control marker ever
+            // lands, and the transaction settles into a definite terminal state.
+            let consistent =
+                status.as_deref() == Some("COMMITTED") || status.as_deref() == Some("ABORTED");
+            if markers != 1 || !consistent {
+                anomalies.push(format!(
+                    "iter {i}: markers={markers} commit={r_commit:?} abort={r_abort:?} status={status:?}"
+                ));
+            }
+        }
+
+        eprintln!(
+            "summary over {iterations}: commit_wins={commit_wins} abort_wins={abort_wins} both_ok={both_ok} both_err={both_err} anomalies={}",
+            anomalies.len()
+        );
+
+        assert!(
+            anomalies.is_empty(),
+            "{} anomalies (expected exactly 1 marker + status matching the winner every time):\n{}",
+            anomalies.len(),
+            anomalies.join("\n"),
         );
 
         Ok(())
