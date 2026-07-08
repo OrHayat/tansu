@@ -35,5 +35,11 @@ and p.id = $3
 and pe.epoch = $4
 and txn_detail."transaction" = txn.id
 and txn_detail.producer_epoch = pe.id
-and txn_detail.started_at is null
-and txn_detail.status is null;
+-- Reset for a brand-new row (never used), or when this producer/epoch's PREVIOUS
+-- transaction on this row has fully resolved -- a new one is now legitimately
+-- beginning. Must NOT reset while status is BEGIN/PREPARE_COMMIT/PREPARE_ABORT --
+-- that would clobber a transaction still actually in flight.
+and (
+    txn_detail.status is null
+    or txn_detail.status in ('COMMITTED', 'ABORTED')
+);
