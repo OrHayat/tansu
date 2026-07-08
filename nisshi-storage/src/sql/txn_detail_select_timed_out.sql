@@ -13,7 +13,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare txn_detail_select_timed_out (text, timestamp) as
+-- prepare txn_detail_select_timed_out (text, timestamptz) as
 -- Returns transactions still in BEGIN past their timeout, for the abort sweep.
 
 select txn.name, p.id, pe.epoch
@@ -30,8 +30,9 @@ where
 
 c.name = $1
 and txn_d.status = 'BEGIN'
+and txn_d.transaction_timeout_ms > 0 -- 0 means "no timeout", never expire it
 and txn_d.started_at is not null
--- $2 is the sweep's "now": the transaction has timed out when more than its
--- own transaction_timeout_ms of elapsed time separates it from started_at.
-and (extract(epoch from cast($2 as timestamp)) - extract(epoch from txn_d.started_at)) * 1000
+-- $2 is the sweep's "now"; both sides are absolute instants (timestamptz), so
+-- the subtraction gives true elapsed time regardless of session timezone.
+and (extract(epoch from cast($2 as timestamptz)) - extract(epoch from txn_d.started_at)) * 1000
     > txn_d.transaction_timeout_ms;
