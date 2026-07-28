@@ -1388,6 +1388,198 @@ impl Postgres {
         Ok(error_code)
     }
 
+    /// Mints a fresh producer, or bumps an existing transactional.id's producer to its next
+    /// epoch -- shared by a plain (-1, -1) InitProducerId request and, once validated
+    /// against the current record, a KIP-360-style epoch-bump recovery request.
+    async fn bump_or_create_producer(
+        &self,
+        transaction_id: Option<&str>,
+        transaction_timeout_ms: i32,
+    ) -> Result<ProducerIdResponse> {
+        if let Some(transaction_id) = transaction_id {
+            let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
+            let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+            if let Some(row) = self
+                .tx_prepare_query_opt(
+                    &tx,
+                    "producer_epoch_for_current_txn.sql",
+                    &[&self.cluster, &transaction_id],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                let id: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
+                let epoch: i16 = row.try_get(1).inspect_err(|err| error!(?err))?;
+                let status = row
+                    .try_get::<_, Option<String>>(2)
+                    .inspect_err(|err| error!(?err))?
+                    .map_or(Ok(None), |status| {
+                        TxnState::from_str(status.as_str()).map(Some)
+                    })?;
+
+                debug!(transaction_id, id, epoch, ?status);
+
+                if let Some(TxnState::Begin) = status {
+                    let error = self
+                        .end_in_tx(transaction_id, id, epoch, false, false, &tx)
+                        .await?;
+
+                    if error != ErrorCode::None {
+                        _ = tx
+                            .rollback()
+                            .await
+                            .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
+
+                        return Ok(ProducerIdResponse { error, id, epoch });
+                    }
+                }
+            }
+
+            let (producer, epoch) = if let Some(row) = self
+                .tx_prepare_query_opt(
+                    &tx,
+                    "txn_select_name.sql",
+                    &[&self.cluster, &transaction_id],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
+
+                let row = self
+                    .tx_prepare_query_one(
+                        &tx,
+                        "producer_epoch_insert.sql",
+                        &[&self.cluster, &producer],
+                    )
+                    .await
+                    .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+                let epoch: i16 = row.try_get(0)?;
+
+                (producer, epoch)
+            } else {
+                let row = self
+                    .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+
+                let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
+
+                let row = self
+                    .tx_prepare_query_one(
+                        &tx,
+                        "producer_epoch_insert.sql",
+                        &[&self.cluster, &producer],
+                    )
+                    .await
+                    .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+                let epoch: i16 = row.try_get(0)?;
+
+                assert_eq!(
+                    1,
+                    self.tx_prepare_execute(
+                        &tx,
+                        "txn_insert.sql",
+                        &[&self.cluster, &transaction_id, &producer],
+                    )
+                    .await
+                    .inspect_err(|err| error!(
+                        self.cluster,
+                        transaction_id,
+                        producer,
+                        ?err
+                    ))?
+                );
+
+                (producer, epoch)
+            };
+
+            debug!(transaction_id, producer, epoch);
+
+            assert_eq!(
+                1,
+                self.tx_prepare_execute(
+                    &tx,
+                    "txn_detail_insert.sql",
+                    &[
+                        &self.cluster,
+                        &transaction_id,
+                        &producer,
+                        &epoch,
+                        &transaction_timeout_ms
+                    ],
+                )
+                .await
+                .inspect_err(|err| error!(
+                    self.cluster,
+                    transaction_id,
+                    producer,
+                    epoch,
+                    transaction_timeout_ms,
+                    ?err
+                ))?
+            );
+
+            let error = match tx.commit().await.inspect_err(|err| {
+                error!(
+                    ?err,
+                    cluster = self.cluster,
+                    transaction_id,
+                    producer,
+                    epoch
+                )
+            }) {
+                Ok(()) => ErrorCode::None,
+                Err(_) => ErrorCode::UnknownServerError,
+            };
+
+            Ok(ProducerIdResponse {
+                error,
+                id: producer,
+                epoch,
+            })
+        } else {
+            let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
+            let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+            let row = self
+                .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                .await
+                .inspect_err(|err| error!(self.cluster, ?err))?;
+
+            let producer: i64 = row.try_get(0)?;
+
+            let row = self
+                .tx_prepare_query_one(
+                    &tx,
+                    "producer_epoch_insert.sql",
+                    &[&self.cluster, &producer],
+                )
+                .await
+                .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+            let epoch: i16 = row.try_get(0)?;
+
+            let error = match tx
+                .commit()
+                .await
+                .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
+            {
+                Ok(()) => ErrorCode::None,
+                Err(_) => ErrorCode::UnknownServerError,
+            };
+
+            Ok(ProducerIdResponse {
+                error,
+                id: producer,
+                epoch,
+            })
+        }
+    }
+
     #[instrument(skip_all)]
     async fn lake_store(
         &self,
@@ -3341,194 +3533,68 @@ impl Storage for Postgres {
             transaction_id, producer_id, producer_epoch
         );
 
-        if producer_id.is_some_and(|producer_id| producer_id == -1)
-            && producer_epoch.is_some_and(|producer_epoch| producer_epoch == -1)
-        {
-            if let Some(transaction_id) = transaction_id {
-                let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-                let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+        // (None, None) means an older InitProducerId API version (<= 2), which has no wire
+        // representation for these fields at all -- there is no other possible meaning for
+        // those versions, so treat it exactly like an explicit (-1, -1) "give me a fresh
+        // epoch" request.
+        let requesting_fresh = matches!((producer_id, producer_epoch), (None, None))
+            || (producer_id.is_some_and(|producer_id| producer_id == -1)
+                && producer_epoch.is_some_and(|producer_epoch| producer_epoch == -1));
 
-                if let Some(row) = self
-                    .tx_prepare_query_opt(
-                        &tx,
-                        "producer_epoch_for_current_txn.sql",
-                        &[&self.cluster, &transaction_id],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err))?
-                {
-                    let id: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-                    let epoch: i16 = row.try_get(1).inspect_err(|err| error!(?err))?;
-                    let status = row
-                        .try_get::<_, Option<String>>(2)
-                        .inspect_err(|err| error!(?err))?
-                        .map_or(Ok(None), |status| {
-                            TxnState::from_str(status.as_str()).map(Some)
-                        })?;
-
-                    debug!(transaction_id, id, epoch, ?status);
-
-                    if let Some(TxnState::Begin) = status {
-                        let error = self
-                            .end_in_tx(transaction_id, id, epoch, false, false, &tx)
-                            .await?;
-
-                        if error != ErrorCode::None {
-                            _ = tx
-                                .rollback()
-                                .await
-                                .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
-
-                            return Ok(ProducerIdResponse { error, id, epoch });
-                        }
-                    }
-                }
-
-                let (producer, epoch) = if let Some(row) = self
-                    .tx_prepare_query_opt(
-                        &tx,
-                        "txn_select_name.sql",
-                        &[&self.cluster, &transaction_id],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err))?
-                {
-                    let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-
-                    let row = self
-                        .tx_prepare_query_one(
-                            &tx,
-                            "producer_epoch_insert.sql",
-                            &[&self.cluster, &producer],
-                        )
-                        .await
-                        .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                    let epoch: i16 = row.try_get(0)?;
-
-                    (producer, epoch)
-                } else {
-                    let row = self
-                        .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
-                        .await
-                        .inspect_err(|err| error!(?err))?;
-
-                    let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-
-                    let row = self
-                        .tx_prepare_query_one(
-                            &tx,
-                            "producer_epoch_insert.sql",
-                            &[&self.cluster, &producer],
-                        )
-                        .await
-                        .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                    let epoch: i16 = row.try_get(0)?;
-
-                    assert_eq!(
-                        1,
-                        self.tx_prepare_execute(
-                            &tx,
-                            "txn_insert.sql",
-                            &[&self.cluster, &transaction_id, &producer],
-                        )
-                        .await
-                        .inspect_err(|err| error!(
-                            self.cluster,
-                            transaction_id,
-                            producer,
-                            ?err
-                        ))?
-                    );
-
-                    (producer, epoch)
-                };
-
-                debug!(transaction_id, producer, epoch);
-
-                assert_eq!(
-                    1,
-                    self.tx_prepare_execute(
-                        &tx,
-                        "txn_detail_insert.sql",
-                        &[
-                            &self.cluster,
-                            &transaction_id,
-                            &producer,
-                            &epoch,
-                            &transaction_timeout_ms
-                        ],
-                    )
-                    .await
-                    .inspect_err(|err| error!(
-                        self.cluster,
-                        transaction_id,
-                        producer,
-                        epoch,
-                        transaction_timeout_ms,
-                        ?err
-                    ))?
-                );
-
-                let error = match tx.commit().await.inspect_err(|err| {
-                    error!(
-                        ?err,
-                        cluster = self.cluster,
-                        transaction_id,
-                        producer,
-                        epoch
-                    )
-                }) {
-                    Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
-                };
-
-                Ok(ProducerIdResponse {
-                    error,
-                    id: producer,
-                    epoch,
-                })
-            } else {
-                let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-                let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
-
-                let row = self
-                    .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
-                    .await
-                    .inspect_err(|err| error!(self.cluster, ?err))?;
-
-                let producer: i64 = row.try_get(0)?;
-
-                let row = self
-                    .tx_prepare_query_one(
-                        &tx,
-                        "producer_epoch_insert.sql",
-                        &[&self.cluster, &producer],
-                    )
-                    .await
-                    .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                let epoch: i16 = row.try_get(0)?;
-
-                let error = match tx
-                    .commit()
-                    .await
-                    .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
-                {
-                    Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
-                };
-
-                Ok(ProducerIdResponse {
-                    error,
-                    id: producer,
-                    epoch,
-                })
-            }
-        } else {
-            todo!()
+        if requesting_fresh {
+            return self
+                .bump_or_create_producer(transaction_id, transaction_timeout_ms)
+                .await;
         }
+
+        let (Some(producer_id), Some(producer_epoch)) = (producer_id, producer_epoch) else {
+            // one of producer_id/producer_epoch was set without the other -- not a
+            // well-formed request under any InitProducerId version.
+            return Ok(ProducerIdResponse {
+                error: ErrorCode::InvalidRequest,
+                id: producer_id.unwrap_or(-1),
+                epoch: producer_epoch.unwrap_or(-1),
+            });
+        };
+
+        // KIP-360-style epoch-bump recovery: the client claims a specific, already-issued
+        // identity (a v3+ producer recovering after e.g. a broker-initiated abort) rather
+        // than asking for a brand new one. Validate the claim against what's actually on
+        // record before treating it the same as a fresh bump -- a stale claim (exactly what
+        // maintain_transactions' sweep produces by fencing a timed-out producer) must be
+        // rejected as ProducerFenced, not silently granted a new epoch.
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        let Some(row) = self
+            .prepare_query_opt(
+                &c,
+                "producer_epoch_current_for_producer.sql",
+                &[&self.cluster, &producer_id],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        else {
+            return Ok(ProducerIdResponse {
+                error: ErrorCode::UnknownProducerId,
+                id: producer_id,
+                epoch: producer_epoch,
+            });
+        };
+
+        let current_epoch = row.try_get::<_, i16>(0).inspect_err(|err| error!(?err))?;
+
+        if producer_epoch != current_epoch {
+            return Ok(ProducerIdResponse {
+                error: ErrorCode::ProducerFenced,
+                id: producer_id,
+                epoch: producer_epoch,
+            });
+        }
+
+        drop(c);
+
+        self.bump_or_create_producer(transaction_id, transaction_timeout_ms)
+            .await
     }
 
     #[instrument(skip_all)]
@@ -5681,6 +5747,189 @@ mod tests {
             1, marker_count,
             "the fenced retry must not write a second control marker",
         );
+
+        Ok(())
+    }
+
+    /// InitProducerId API versions <= 2 have no wire representation for producer_id/epoch at
+    /// all, so they decode as (None, None) -- must be treated as a fresh-epoch request, not
+    /// panic.
+    #[tokio::test]
+    async fn init_producer_old_api_version_is_treated_as_fresh() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_old_api_version_is_treated_as_fresh: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, None, None)
+            .await?;
+
+        assert_eq!(ErrorCode::None, producer.error);
+
+        Ok(())
+    }
+
+    /// A v3+ client presenting its current, still-valid (producer_id, producer_epoch) -- the
+    /// KIP-360 recovery shape -- must be validated against the record and, once confirmed,
+    /// bumped to a new epoch exactly like a fresh (-1, -1) request.
+    #[tokio::test]
+    async fn init_producer_recovery_with_current_epoch_succeeds() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_recovery_with_current_epoch_succeeds: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        let recovered = storage
+            .init_producer(
+                Some(transaction_id.as_str()),
+                10_000,
+                Some(producer.id),
+                Some(producer.epoch),
+            )
+            .await?;
+
+        assert_eq!(ErrorCode::None, recovered.error);
+        assert_eq!(producer.id, recovered.id);
+        assert!(
+            recovered.epoch > producer.epoch,
+            "a validated recovery request must still bump the epoch (was {}, now {})",
+            producer.epoch,
+            recovered.epoch,
+        );
+
+        Ok(())
+    }
+
+    /// A v3+ client presenting a STALE (producer_id, producer_epoch) -- exactly what happens
+    /// after maintain_transactions' sweep fences a timed-out producer -- must be rejected as
+    /// ProducerFenced, not silently granted a new epoch (and not panic).
+    #[tokio::test]
+    async fn init_producer_recovery_with_stale_epoch_is_fenced() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_recovery_with_stale_epoch_is_fenced: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        // someone else bumps the epoch (a reconnect, or the sweep fencing this producer),
+        // making `producer`'s epoch stale.
+        _ = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        let stale_recovery = storage
+            .init_producer(
+                Some(transaction_id.as_str()),
+                10_000,
+                Some(producer.id),
+                Some(producer.epoch),
+            )
+            .await?;
+
+        assert_eq!(
+            ErrorCode::ProducerFenced,
+            stale_recovery.error,
+            "a recovery request carrying a stale epoch must be rejected as ProducerFenced"
+        );
+
+        Ok(())
+    }
+
+    /// A malformed InitProducerId request -- one of producer_id/producer_epoch present
+    /// without the other -- is not a valid shape under any protocol version and must be
+    /// rejected, not panic.
+    #[tokio::test]
+    async fn init_producer_malformed_partial_fields_is_rejected() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_malformed_partial_fields_is_rejected: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let response = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(42), None)
+            .await?;
+
+        assert_eq!(ErrorCode::InvalidRequest, response.error);
 
         Ok(())
     }
