@@ -3903,4 +3903,84 @@ mod tests {
 
         Ok(())
     }
+
+    /// AddPartitionsToTxn is idempotent in Kafka: a partition already in the transaction is
+    /// a no-op, not an error. Clients do re-send it -- a retry, or a produce racing the
+    /// first add -- and the unique (txn_detail, topition) constraint turned that into a
+    /// database error surfacing as a broken connection mid-transaction.
+    #[tokio::test]
+    async fn txn_add_partitions_is_idempotent() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_add_partitions_is_idempotent: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        let request = || TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: transaction_id.clone(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            topics: vec![
+                AddPartitionsToTxnTopic::default()
+                    .name(topic_name.clone())
+                    .partitions(Some((0..num_partitions).collect())),
+            ],
+        };
+
+        for attempt in 1..=2 {
+            let response = storage
+                .txn_add_partitions(request())
+                .await
+                .inspect_err(|err| {
+                    panic!("add #{attempt} of the same partition must succeed, got {err:?}")
+                })?;
+
+            for topic in response.zero_to_three() {
+                for partition in topic.results_by_partition.as_deref().unwrap_or_default() {
+                    assert_eq!(
+                        i16::from(ErrorCode::None),
+                        partition.partition_error_code,
+                        "add #{attempt} of the same partition must report no error",
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
