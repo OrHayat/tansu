@@ -15,6 +15,7 @@
 //! PostgreSQL Storage engine
 
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     fmt::Debug,
     hash::Hash,
@@ -997,9 +998,32 @@ impl Postgres {
         producer_id: i64,
         producer_epoch: i16,
         committed: bool,
+        fence: bool,
         tx: &Transaction<'_>,
     ) -> Result<ErrorCode> {
-        debug!(cluster = ?self.cluster, ?transaction_id, ?producer_id, ?producer_epoch, ?committed);
+        debug!(cluster = ?self.cluster, ?transaction_id, ?producer_id, ?producer_epoch, ?committed, fence);
+
+        // Check the producer's identity before touching this specific transaction's state
+        // at all: a request carrying a stale epoch is not this transaction's problem, it's
+        // an identity problem, and must be reported as such (ProducerFenced) regardless of
+        // what the stale epoch's own txn_detail row says.
+        let Some(row) = self
+            .tx_prepare_query_opt(
+                tx,
+                "producer_epoch_current_for_producer.sql",
+                &[&self.cluster, &producer_id],
+            )
+            .await?
+        else {
+            return Ok(ErrorCode::UnknownProducerId);
+        };
+        let current_epoch = row.try_get::<_, i16>(0)?;
+
+        match producer_epoch.cmp(&current_epoch) {
+            Ordering::Less => return Ok(ErrorCode::ProducerFenced),
+            Ordering::Greater => return Ok(ErrorCode::InvalidProducerEpoch),
+            Ordering::Equal => {}
+        }
 
         // Lock the row before touching anything else: if a concurrent caller (a real
         // EndTxn racing the maintain_transactions sweep, or a retried EndTxn) already
@@ -1069,6 +1093,23 @@ impl Postgres {
             }
             None | Some(TxnState::Begin) => true,
         };
+
+        // A broker-initiated timeout abort (the sweep) must fence the producer, not just
+        // clean up this transaction's own bookkeeping: the producer might still be alive
+        // and about to send more data under this same epoch. Bump it now, before doing any
+        // of the actual abort work below (which can be deferred behind an older still-open
+        // transaction) -- idempotent_sequence_check already rejects a stale epoch with
+        // ProducerFenced, this just needs to make the current one stale. Only on the first
+        // call that actually touches this transaction (write_marker), not a matching retry.
+        if fence && write_marker {
+            _ = self
+                .tx_prepare_query_one(
+                    tx,
+                    "producer_epoch_insert.sql",
+                    &[&self.cluster, &producer_id],
+                )
+                .await?;
+        }
 
         let mut overlaps = vec![];
 
@@ -1315,6 +1356,36 @@ impl Postgres {
         }
 
         Ok(ErrorCode::None)
+    }
+
+    /// Used only by maintain_transactions: aborts a transaction the sweep has decided is
+    /// timed out, AND fences the producer's epoch -- unlike a real client's own EndTxn, the
+    /// producer here might still be alive and about to send more data, so the broker must
+    /// unilaterally invalidate its current epoch rather than just cleaning up bookkeeping.
+    #[instrument(skip(self))]
+    async fn abort_timed_out(
+        &self,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<ErrorCode> {
+        let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
+        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+        let error_code = self
+            .end_in_tx(
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                false,
+                true,
+                &tx,
+            )
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(error_code)
     }
 
     #[instrument(skip_all)]
@@ -3356,7 +3427,7 @@ impl Storage for Postgres {
 
                     if let Some(TxnState::Begin) = status {
                         let error = self
-                            .end_in_tx(transaction_id, id, epoch, false, &tx)
+                            .end_in_tx(transaction_id, id, epoch, false, false, &tx)
                             .await?;
 
                         if error != ErrorCode::None {
@@ -3767,7 +3838,14 @@ impl Storage for Postgres {
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
         let error_code = self
-            .end_in_tx(transaction_id, producer_id, producer_epoch, committed, &tx)
+            .end_in_tx(
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                committed,
+                false,
+                &tx,
+            )
             .await?;
 
         tx.commit().await?;
@@ -3802,7 +3880,7 @@ impl Storage for Postgres {
             )
             .await?;
 
-        // release the listing connection before aborting: each txn_end below checks
+        // release the listing connection before aborting: each abort_timed_out below checks
         // out its own connection from the same pool, and the pool can be small
         // (or exactly 1), so holding this one idle risks starving/deadlocking them.
         drop(c);
@@ -3813,7 +3891,7 @@ impl Storage for Postgres {
             let producer_epoch = row.try_get::<_, i16>(2)?;
 
             match self
-                .txn_end(&transaction_id, producer_id, producer_epoch, false)
+                .abort_timed_out(&transaction_id, producer_id, producer_epoch)
                 .await
             {
                 Ok(ErrorCode::None) => {}
@@ -4681,11 +4759,13 @@ mod tests {
         Ok(())
     }
 
-    /// Once maintain_transactions sweep-aborts a timed-out transaction, a LATE real
-    /// EndTxn(commit=true) for that same transaction (e.g. a slow producer that was declared
-    /// dead but is actually still alive and finally calls commit) must be rejected, not acked
-    /// as success -- the data was already irreversibly reported as aborted, so telling the
-    /// caller their commit "worked" would be a lie.
+    /// Once maintain_transactions sweep-aborts a timed-out transaction, it also fences the
+    /// producer's epoch -- so a LATE real EndTxn(commit=true) for that same transaction (e.g.
+    /// a slow producer that was declared dead but is actually still alive and finally calls
+    /// commit) must be rejected with ProducerFenced, not acked as success -- the data was
+    /// already irreversibly reported as aborted, so telling the caller their commit "worked"
+    /// would be a lie, and ProducerFenced (rather than a generic InvalidTxnState) is what
+    /// tells a real Kafka client library to stop retrying and rebuild its producer.
     #[tokio::test]
     async fn late_commit_after_sweep_abort_is_rejected() -> Result<()> {
         let cluster = alphanumeric_string(15);
@@ -4774,10 +4854,10 @@ mod tests {
             .await?;
 
         assert_eq!(
-            ErrorCode::InvalidTxnState,
+            ErrorCode::ProducerFenced,
             late_commit_result,
-            "a late commit() after a sweep-abort must be rejected, not acked as success -- \
-             the caller has no other way to learn their commit didn't apply",
+            "a late commit() after a sweep-abort must be rejected as ProducerFenced (the \
+             sweep fences the producer's epoch on timeout-abort), not acked as success",
         );
 
         Ok(())
@@ -6123,6 +6203,248 @@ mod tests {
             "aborted range's first_offset is {} but should be {} (epoch 1's own start) -- got \
              offset {} (epoch 0's COMMITTED record) instead",
             aborted[0].first_offset, epoch1_offset, epoch0_offset,
+        );
+
+        Ok(())
+    }
+
+    /// The actual data-safety guarantee fencing exists for: once maintain_transactions
+    /// sweep-aborts a timed-out transaction, a still-alive "zombie" producer trying to send
+    /// MORE data under its old epoch must be rejected outright -- not silently accepted and
+    /// later delivered to read_committed consumers as if it were ordinary committed data.
+    #[tokio::test]
+    async fn sweep_fenced_producer_zombie_produce_is_rejected() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping sweep_fenced_producer_zombie_produce_is_rejected: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"before-sweep").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // the sweep declares this producer's transaction dead -- and must fence it.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let stage_before_zombie_write = storage.offset_stage(&topition).await?;
+
+        // the "zombie" producer, still alive, tries to send more data under its old epoch.
+        let zombie_batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"zombie-write").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(1)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let zombie_result = storage
+            .produce(Some(transaction_id.as_str()), &topition, zombie_batch)
+            .await;
+
+        assert!(
+            matches!(zombie_result, Err(Error::Api(ErrorCode::ProducerFenced))),
+            "a zombie produce under the pre-sweep epoch must be rejected as ProducerFenced, \
+             got {zombie_result:?}",
+        );
+
+        let stage_after_zombie_write = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            stage_before_zombie_write.high_watermark, stage_after_zombie_write.high_watermark,
+            "the rejected zombie write must not have been appended to the log",
+        );
+
+        Ok(())
+    }
+
+    /// A producer fenced by the sweep must still be able to recover normally -- reconnecting
+    /// via InitProducerId(-1, -1) for the same transactional.id gets a fresh epoch strictly
+    /// after the sweep's fence, and can then produce/commit normally under it.
+    #[tokio::test]
+    async fn sweep_fenced_producer_can_reconnect_and_produce_normally() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping sweep_fenced_producer_can_reconnect_and_produce_normally: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"before-sweep").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let reconnected = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        assert_eq!(
+            producer.id, reconnected.id,
+            "reconnect must keep the same stable producer_id"
+        );
+        assert!(
+            reconnected.epoch > producer.epoch,
+            "reconnect must return an epoch strictly after the sweep's fence (was {}, now {})",
+            producer.epoch,
+            reconnected.epoch,
+        );
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: reconnected.id,
+                producer_epoch: reconnected.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"after-reconnect").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(reconnected.id)
+            .producer_epoch(reconnected.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&transaction_id, reconnected.id, reconnected.epoch, true)
+                .await?,
+            "the reconnected producer's transaction must commit normally",
         );
 
         Ok(())
