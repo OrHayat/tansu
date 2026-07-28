@@ -35,4 +35,10 @@ and t.name = $2
 and tp.partition = $3
 and txn.name = $4
 and p.id = $5
-and pe.epoch = $6;
+and pe.epoch = $6
+
+-- AddPartitionsToTxn is idempotent in Kafka: a partition already in this
+-- transaction is a no-op, not an error. A client re-sending the same
+-- partition (a retry, or a produce racing the first add) must not fail with
+-- a unique violation on (txn_detail, topition).
+on conflict (txn_detail, topition) do nothing;
