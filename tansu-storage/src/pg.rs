@@ -6778,4 +6778,156 @@ mod tests {
 
         Ok(())
     }
+
+    /// A producer running several transactions under one epoch reuses a single txn_detail
+    /// row, so each new transaction must reset that row's status. When
+    /// txn_detail_update_started_at only reset an untouched row, the row kept the *first*
+    /// transaction's terminal status forever, and end_in_tx's outcome-aware guard then
+    /// judged every later EndTxn against that stale outcome: an abort following a commit
+    /// on the same epoch was refused with InvalidTxnState. (A commit following a commit
+    /// merely agrees with the stale status and silently no-ops, which is why the outcomes
+    /// below alternate -- a commit-only sequence cannot see this at all.)
+    #[tokio::test]
+    async fn sequential_transactions_on_one_epoch_are_each_resolved() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping every_transaction_on_one_epoch_can_commit: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+        let transaction_id = alphanumeric_string(10);
+
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        // Three transactions back to back on the same producer and epoch -- the same
+        // txn_detail row each time. Idempotent-producer sequence numbers must strictly
+        // increase per producer/epoch even across separate transactions, hence the counter.
+        for (sequence, commit) in [(0, true), (1, false), (2, true)] {
+            _ = storage
+                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                    transaction_id: transaction_id.clone(),
+                    producer_id: producer.id,
+                    producer_epoch: producer.epoch,
+                    topics: vec![
+                        AddPartitionsToTxnTopic::default()
+                            .name(topic_name.clone())
+                            .partitions(Some((0..num_partitions).collect())),
+                    ],
+                })
+                .await?;
+
+            let batch = Batch::builder()
+                .record(Record::builder().value(Bytes::from_static(b"sequential").into()))
+                .attributes(BatchAttribute::default().transaction(true).into())
+                .producer_id(producer.id)
+                .producer_epoch(producer.epoch)
+                .base_sequence(sequence)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = storage
+                .produce(Some(transaction_id.as_str()), &topition, batch)
+                .await?;
+
+            let outcome = storage
+                .txn_end(transaction_id.as_str(), producer.id, producer.epoch, commit)
+                .await?;
+
+            assert_eq!(
+                ErrorCode::None,
+                outcome,
+                "transaction #{} on this epoch ({}) must be honoured, not judged against the \
+                 previous transaction's outcome",
+                sequence + 1,
+                if commit { "commit" } else { "abort" },
+            );
+
+            // A resolved transaction releases what it pinned. If the call was silently a
+            // no-op, its produce offsets are still registered and hold the LSO back.
+            let stage = storage.offset_stage(&topition).await?;
+
+            assert_eq!(
+                stage.high_watermark,
+                stage.last_stable,
+                "after resolving transaction #{}, nothing should still pin the last stable \
+                 offset (last_stable={}, high_watermark={})",
+                sequence + 1,
+                stage.last_stable,
+                stage.high_watermark,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// txn_detail.started_at must stay timestamptz. The sweep compares it against a Rust
+    /// SystemTime -- an absolute instant -- and a zone-less `timestamp` stores
+    /// current_timestamp's reading in whatever the session's TimeZone happens to be, with
+    /// the zone discarded. On a non-UTC server that silently shifts every timeout decision
+    /// by the server's offset. No behavioural test can catch it here: the containers this
+    /// suite runs against are UTC, where the two types coincide. So assert the column type.
+    #[tokio::test]
+    async fn txn_detail_started_at_is_timestamptz() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let Ok(c) = storage.connection().await else {
+            eprintln!("skipping txn_detail_started_at_is_timestamptz: no connection");
+            return Ok(());
+        };
+
+        let row = c
+            .query_one(
+                "select data_type from information_schema.columns \
+                 where table_name = 'txn_detail' and column_name = 'started_at'",
+                &[],
+            )
+            .await?;
+
+        assert_eq!(
+            "timestamp with time zone",
+            row.try_get::<_, String>(0)?,
+            "started_at must be timestamptz: the timeout sweep compares it against an \
+             absolute instant",
+        );
+
+        Ok(())
+    }
 }
