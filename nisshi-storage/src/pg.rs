@@ -15,6 +15,7 @@
 //! PostgreSQL Storage engine
 
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     fmt::Debug,
     hash::Hash,
@@ -997,9 +998,118 @@ impl Postgres {
         producer_id: i64,
         producer_epoch: i16,
         committed: bool,
+        fence: bool,
         tx: &Transaction<'_>,
     ) -> Result<ErrorCode> {
-        debug!(cluster = ?self.cluster, ?transaction_id, ?producer_id, ?producer_epoch, ?committed);
+        debug!(cluster = ?self.cluster, ?transaction_id, ?producer_id, ?producer_epoch, ?committed, fence);
+
+        // Check the producer's identity before touching this specific transaction's state
+        // at all: a request carrying a stale epoch is not this transaction's problem, it's
+        // an identity problem, and must be reported as such (ProducerFenced) regardless of
+        // what the stale epoch's own txn_detail row says.
+        let Some(row) = self
+            .tx_prepare_query_opt(
+                tx,
+                "producer_epoch_current_for_producer.sql",
+                &[&self.cluster, &producer_id],
+            )
+            .await?
+        else {
+            return Ok(ErrorCode::UnknownProducerId);
+        };
+        let current_epoch = row.try_get::<_, i16>(0)?;
+
+        match producer_epoch.cmp(&current_epoch) {
+            Ordering::Less => return Ok(ErrorCode::ProducerFenced),
+            Ordering::Greater => return Ok(ErrorCode::InvalidProducerEpoch),
+            Ordering::Equal => {}
+        }
+
+        // Lock the row before touching anything else: if a concurrent caller (a real
+        // EndTxn racing the maintain_transactions sweep, or a retried EndTxn) already
+        // finalized this transaction, this blocks until it commits, then sees the
+        // terminal status below and no-ops instead of writing a second marker.
+        let status = match self
+            .tx_prepare_query_opt(
+                tx,
+                "txn_detail_select_status_for_update.sql",
+                &[
+                    &self.cluster,
+                    &transaction_id,
+                    &producer_id,
+                    &producer_epoch,
+                ],
+            )
+            .await?
+        {
+            Some(row) => row
+                .try_get::<_, Option<String>>(0)? // nullable transaction status column -> Option<String>
+                .map(TxnState::try_from) // parse if present -> Option<Result<TxnState, _>>
+                .transpose()?, // Option<Result<_>> -> Result<Option<_>>, then `?` -> Option<TxnState>
+            None => None, // no txn_detail row found
+        };
+
+        // Outcome-aware idempotency: a retry (or a race between a real EndTxn and the sweep)
+        // must only no-op when it agrees with what's already staged or finalized for this
+        // transaction. A conflicting request -- e.g. a real commit arriving after the sweep
+        // already staged/finalized an abort -- is a genuine protocol error (InvalidTxnState is
+        // exactly Kafka's error code for "transactional operation attempted in an invalid
+        // state"), not something to silently paper over by claiming success either way.
+        //
+        // PREPARE_COMMIT/PREPARE_ABORT means an earlier call already wrote this transaction's
+        // control marker and is only waiting on an older, still-open transaction on the same
+        // partition(s) to resolve first -- so a matching retry must NOT write a second marker,
+        // it should just re-check whether those older transactions have since resolved.
+        let write_marker = match status {
+            Some(TxnState::Committed) => {
+                debug!(transaction_id, producer_id, producer_epoch, ?status);
+                return Ok(if committed {
+                    ErrorCode::None
+                } else {
+                    ErrorCode::InvalidTxnState
+                });
+            }
+            Some(TxnState::Aborted) => {
+                debug!(transaction_id, producer_id, producer_epoch, ?status);
+                return Ok(if committed {
+                    ErrorCode::InvalidTxnState
+                } else {
+                    ErrorCode::None
+                });
+            }
+            Some(TxnState::PrepareCommit) => {
+                if !committed {
+                    debug!(transaction_id, producer_id, producer_epoch, ?status);
+                    return Ok(ErrorCode::InvalidTxnState);
+                }
+                false
+            }
+            Some(TxnState::PrepareAbort) => {
+                if committed {
+                    debug!(transaction_id, producer_id, producer_epoch, ?status);
+                    return Ok(ErrorCode::InvalidTxnState);
+                }
+                false
+            }
+            None | Some(TxnState::Begin) => true,
+        };
+
+        // A broker-initiated timeout abort (the sweep) must fence the producer, not just
+        // clean up this transaction's own bookkeeping: the producer might still be alive
+        // and about to send more data under this same epoch. Bump it now, before doing any
+        // of the actual abort work below (which can be deferred behind an older still-open
+        // transaction) -- idempotent_sequence_check already rejects a stale epoch with
+        // ProducerFenced, this just needs to make the current one stale. Only on the first
+        // call that actually touches this transaction (write_marker), not a matching retry.
+        if fence && write_marker {
+            _ = self
+                .tx_prepare_query_one(
+                    tx,
+                    "producer_epoch_insert.sql",
+                    &[&self.cluster, &producer_id],
+                )
+                .await?;
+        }
 
         let mut overlaps = vec![];
 
@@ -1024,37 +1134,42 @@ impl Postgres {
 
             debug!(?topition);
 
-            let control_batch: Bytes = if committed {
-                ControlBatch::default().commit().try_into()?
-            } else {
-                ControlBatch::default().abort().try_into()?
-            };
-            let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
+            // Only write the control marker the first time this transaction is finalized or
+            // deferred -- a matching retry while already staged in PREPARE_COMMIT/
+            // PREPARE_ABORT must not write a second one (see the status match above).
+            if write_marker {
+                let control_batch: Bytes = if committed {
+                    ControlBatch::default().commit().try_into()?
+                } else {
+                    ControlBatch::default().abort().try_into()?
+                };
+                let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
 
-            let batch = Batch::builder()
-                .record(
-                    Record::builder()
-                        .key(control_batch.into())
-                        .value(end_transaction_marker.into()),
-                )
-                .attributes(
-                    BatchAttribute::default()
-                        .control(true)
-                        .transaction(true)
-                        .into(),
-                )
-                .producer_id(producer_id)
-                .producer_epoch(producer_epoch)
-                .base_sequence(-1)
-                .build()
-                .and_then(TryInto::try_into)
-                .inspect(|deflated| debug!(?deflated))?;
+                let batch = Batch::builder()
+                    .record(
+                        Record::builder()
+                            .key(control_batch.into())
+                            .value(end_transaction_marker.into()),
+                    )
+                    .attributes(
+                        BatchAttribute::default()
+                            .control(true)
+                            .transaction(true)
+                            .into(),
+                    )
+                    .producer_id(producer_id)
+                    .producer_epoch(producer_epoch)
+                    .base_sequence(-1)
+                    .build()
+                    .and_then(TryInto::try_into)
+                    .inspect(|deflated| debug!(?deflated))?;
 
-            let offset = self
-                .produce_in_tx(Some(transaction_id), &topition, batch, tx)
-                .await?;
+                let offset = self
+                    .produce_in_tx(Some(transaction_id), &topition, batch, tx)
+                    .await?;
 
-            debug!(offset, ?topition);
+                debug!(offset, ?topition);
+            }
 
             let row = self
                 .tx_prepare_query_one(
@@ -1241,6 +1356,228 @@ impl Postgres {
         }
 
         Ok(ErrorCode::None)
+    }
+
+    /// Used only by maintain_transactions: aborts a transaction the sweep has decided is
+    /// timed out, AND fences the producer's epoch -- unlike a real client's own EndTxn, the
+    /// producer here might still be alive and about to send more data, so the broker must
+    /// unilaterally invalidate its current epoch rather than just cleaning up bookkeeping.
+    #[instrument(skip(self))]
+    async fn abort_timed_out(
+        &self,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<ErrorCode> {
+        let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
+        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+        let error_code = self
+            .end_in_tx(
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                false,
+                true,
+                &tx,
+            )
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(error_code)
+    }
+
+    /// Mints a fresh producer, or bumps an existing transactional.id's producer to its next
+    /// epoch -- shared by a plain (-1, -1) InitProducerId request and, once validated
+    /// against the current record, a KIP-360-style epoch-bump recovery request.
+    async fn bump_or_create_producer(
+        &self,
+        transaction_id: Option<&str>,
+        transaction_timeout_ms: i32,
+    ) -> Result<ProducerIdResponse> {
+        if let Some(transaction_id) = transaction_id {
+            let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
+            let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+            if let Some(row) = self
+                .tx_prepare_query_opt(
+                    &tx,
+                    "producer_epoch_for_current_txn.sql",
+                    &[&self.cluster, &transaction_id],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                let id: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
+                let epoch: i16 = row.try_get(1).inspect_err(|err| error!(?err))?;
+                let status = row
+                    .try_get::<_, Option<String>>(2)
+                    .inspect_err(|err| error!(?err))?
+                    .map_or(Ok(None), |status| {
+                        TxnState::from_str(status.as_str()).map(Some)
+                    })?;
+
+                debug!(transaction_id, id, epoch, ?status);
+
+                if let Some(TxnState::Begin) = status {
+                    let error = self
+                        .end_in_tx(transaction_id, id, epoch, false, false, &tx)
+                        .await?;
+
+                    if error != ErrorCode::None {
+                        _ = tx
+                            .rollback()
+                            .await
+                            .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
+
+                        return Ok(ProducerIdResponse { error, id, epoch });
+                    }
+                }
+            }
+
+            let (producer, epoch) = if let Some(row) = self
+                .tx_prepare_query_opt(
+                    &tx,
+                    "txn_select_name.sql",
+                    &[&self.cluster, &transaction_id],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
+
+                let row = self
+                    .tx_prepare_query_one(
+                        &tx,
+                        "producer_epoch_insert.sql",
+                        &[&self.cluster, &producer],
+                    )
+                    .await
+                    .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+                let epoch: i16 = row.try_get(0)?;
+
+                (producer, epoch)
+            } else {
+                let row = self
+                    .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+
+                let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
+
+                let row = self
+                    .tx_prepare_query_one(
+                        &tx,
+                        "producer_epoch_insert.sql",
+                        &[&self.cluster, &producer],
+                    )
+                    .await
+                    .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+                let epoch: i16 = row.try_get(0)?;
+
+                assert_eq!(
+                    1,
+                    self.tx_prepare_execute(
+                        &tx,
+                        "txn_insert.sql",
+                        &[&self.cluster, &transaction_id, &producer],
+                    )
+                    .await
+                    .inspect_err(|err| error!(
+                        self.cluster,
+                        transaction_id,
+                        producer,
+                        ?err
+                    ))?
+                );
+
+                (producer, epoch)
+            };
+
+            debug!(transaction_id, producer, epoch);
+
+            assert_eq!(
+                1,
+                self.tx_prepare_execute(
+                    &tx,
+                    "txn_detail_insert.sql",
+                    &[
+                        &self.cluster,
+                        &transaction_id,
+                        &producer,
+                        &epoch,
+                        &transaction_timeout_ms
+                    ],
+                )
+                .await
+                .inspect_err(|err| error!(
+                    self.cluster,
+                    transaction_id,
+                    producer,
+                    epoch,
+                    transaction_timeout_ms,
+                    ?err
+                ))?
+            );
+
+            let error = match tx.commit().await.inspect_err(|err| {
+                error!(
+                    ?err,
+                    cluster = self.cluster,
+                    transaction_id,
+                    producer,
+                    epoch
+                )
+            }) {
+                Ok(()) => ErrorCode::None,
+                Err(_) => ErrorCode::UnknownServerError,
+            };
+
+            Ok(ProducerIdResponse {
+                error,
+                id: producer,
+                epoch,
+            })
+        } else {
+            let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
+            let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+            let row = self
+                .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
+                .await
+                .inspect_err(|err| error!(self.cluster, ?err))?;
+
+            let producer: i64 = row.try_get(0)?;
+
+            let row = self
+                .tx_prepare_query_one(
+                    &tx,
+                    "producer_epoch_insert.sql",
+                    &[&self.cluster, &producer],
+                )
+                .await
+                .inspect_err(|err| error!(self.cluster, producer, ?err))?;
+
+            let epoch: i16 = row.try_get(0)?;
+
+            let error = match tx
+                .commit()
+                .await
+                .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
+            {
+                Ok(()) => ErrorCode::None,
+                Err(_) => ErrorCode::UnknownServerError,
+            };
+
+            Ok(ProducerIdResponse {
+                error,
+                id: producer,
+                epoch,
+            })
+        }
     }
 
     #[instrument(skip_all)]
@@ -3196,194 +3533,68 @@ impl Storage for Postgres {
             transaction_id, producer_id, producer_epoch
         );
 
-        if producer_id.is_some_and(|producer_id| producer_id == -1)
-            && producer_epoch.is_some_and(|producer_epoch| producer_epoch == -1)
-        {
-            if let Some(transaction_id) = transaction_id {
-                let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-                let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+        // (None, None) means an older InitProducerId API version (<= 2), which has no wire
+        // representation for these fields at all -- there is no other possible meaning for
+        // those versions, so treat it exactly like an explicit (-1, -1) "give me a fresh
+        // epoch" request.
+        let requesting_fresh = matches!((producer_id, producer_epoch), (None, None))
+            || (producer_id.is_some_and(|producer_id| producer_id == -1)
+                && producer_epoch.is_some_and(|producer_epoch| producer_epoch == -1));
 
-                if let Some(row) = self
-                    .tx_prepare_query_opt(
-                        &tx,
-                        "producer_epoch_for_current_txn.sql",
-                        &[&self.cluster, &transaction_id],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err))?
-                {
-                    let id: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-                    let epoch: i16 = row.try_get(1).inspect_err(|err| error!(?err))?;
-                    let status = row
-                        .try_get::<_, Option<String>>(2)
-                        .inspect_err(|err| error!(?err))?
-                        .map_or(Ok(None), |status| {
-                            TxnState::from_str(status.as_str()).map(Some)
-                        })?;
-
-                    debug!(transaction_id, id, epoch, ?status);
-
-                    if let Some(TxnState::Begin) = status {
-                        let error = self
-                            .end_in_tx(transaction_id, id, epoch, false, &tx)
-                            .await?;
-
-                        if error != ErrorCode::None {
-                            _ = tx
-                                .rollback()
-                                .await
-                                .inspect_err(|err| error!(?err, ?transaction_id, id, epoch));
-
-                            return Ok(ProducerIdResponse { error, id, epoch });
-                        }
-                    }
-                }
-
-                let (producer, epoch) = if let Some(row) = self
-                    .tx_prepare_query_opt(
-                        &tx,
-                        "txn_select_name.sql",
-                        &[&self.cluster, &transaction_id],
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err))?
-                {
-                    let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-
-                    let row = self
-                        .tx_prepare_query_one(
-                            &tx,
-                            "producer_epoch_insert.sql",
-                            &[&self.cluster, &producer],
-                        )
-                        .await
-                        .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                    let epoch: i16 = row.try_get(0)?;
-
-                    (producer, epoch)
-                } else {
-                    let row = self
-                        .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
-                        .await
-                        .inspect_err(|err| error!(?err))?;
-
-                    let producer: i64 = row.try_get(0).inspect_err(|err| error!(?err))?;
-
-                    let row = self
-                        .tx_prepare_query_one(
-                            &tx,
-                            "producer_epoch_insert.sql",
-                            &[&self.cluster, &producer],
-                        )
-                        .await
-                        .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                    let epoch: i16 = row.try_get(0)?;
-
-                    assert_eq!(
-                        1,
-                        self.tx_prepare_execute(
-                            &tx,
-                            "txn_insert.sql",
-                            &[&self.cluster, &transaction_id, &producer],
-                        )
-                        .await
-                        .inspect_err(|err| error!(
-                            self.cluster,
-                            transaction_id,
-                            producer,
-                            ?err
-                        ))?
-                    );
-
-                    (producer, epoch)
-                };
-
-                debug!(transaction_id, producer, epoch);
-
-                assert_eq!(
-                    1,
-                    self.tx_prepare_execute(
-                        &tx,
-                        "txn_detail_insert.sql",
-                        &[
-                            &self.cluster,
-                            &transaction_id,
-                            &producer,
-                            &epoch,
-                            &transaction_timeout_ms
-                        ],
-                    )
-                    .await
-                    .inspect_err(|err| error!(
-                        self.cluster,
-                        transaction_id,
-                        producer,
-                        epoch,
-                        transaction_timeout_ms,
-                        ?err
-                    ))?
-                );
-
-                let error = match tx.commit().await.inspect_err(|err| {
-                    error!(
-                        ?err,
-                        cluster = self.cluster,
-                        transaction_id,
-                        producer,
-                        epoch
-                    )
-                }) {
-                    Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
-                };
-
-                Ok(ProducerIdResponse {
-                    error,
-                    id: producer,
-                    epoch,
-                })
-            } else {
-                let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-                let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
-
-                let row = self
-                    .tx_prepare_query_one(&tx, "producer_insert.sql", &[&self.cluster])
-                    .await
-                    .inspect_err(|err| error!(self.cluster, ?err))?;
-
-                let producer: i64 = row.try_get(0)?;
-
-                let row = self
-                    .tx_prepare_query_one(
-                        &tx,
-                        "producer_epoch_insert.sql",
-                        &[&self.cluster, &producer],
-                    )
-                    .await
-                    .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                let epoch: i16 = row.try_get(0)?;
-
-                let error = match tx
-                    .commit()
-                    .await
-                    .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
-                {
-                    Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
-                };
-
-                Ok(ProducerIdResponse {
-                    error,
-                    id: producer,
-                    epoch,
-                })
-            }
-        } else {
-            todo!()
+        if requesting_fresh {
+            return self
+                .bump_or_create_producer(transaction_id, transaction_timeout_ms)
+                .await;
         }
+
+        let (Some(producer_id), Some(producer_epoch)) = (producer_id, producer_epoch) else {
+            // one of producer_id/producer_epoch was set without the other -- not a
+            // well-formed request under any InitProducerId version.
+            return Ok(ProducerIdResponse {
+                error: ErrorCode::InvalidRequest,
+                id: producer_id.unwrap_or(-1),
+                epoch: producer_epoch.unwrap_or(-1),
+            });
+        };
+
+        // KIP-360-style epoch-bump recovery: the client claims a specific, already-issued
+        // identity (a v3+ producer recovering after e.g. a broker-initiated abort) rather
+        // than asking for a brand new one. Validate the claim against what's actually on
+        // record before treating it the same as a fresh bump -- a stale claim (exactly what
+        // maintain_transactions' sweep produces by fencing a timed-out producer) must be
+        // rejected as ProducerFenced, not silently granted a new epoch.
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        let Some(row) = self
+            .prepare_query_opt(
+                &c,
+                "producer_epoch_current_for_producer.sql",
+                &[&self.cluster, &producer_id],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        else {
+            return Ok(ProducerIdResponse {
+                error: ErrorCode::UnknownProducerId,
+                id: producer_id,
+                epoch: producer_epoch,
+            });
+        };
+
+        let current_epoch = row.try_get::<_, i16>(0).inspect_err(|err| error!(?err))?;
+
+        if producer_epoch != current_epoch {
+            return Ok(ProducerIdResponse {
+                error: ErrorCode::ProducerFenced,
+                id: producer_id,
+                epoch: producer_epoch,
+            });
+        }
+
+        drop(c);
+
+        self.bump_or_create_producer(transaction_id, transaction_timeout_ms)
+            .await
     }
 
     #[instrument(skip_all)]
@@ -3636,7 +3847,14 @@ impl Storage for Postgres {
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
         let error_code = self
-            .end_in_tx(transaction_id, producer_id, producer_epoch, committed, &tx)
+            .end_in_tx(
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                committed,
+                false,
+                &tx,
+            )
             .await?;
 
         tx.commit().await?;
@@ -3659,7 +3877,50 @@ impl Storage for Postgres {
         Ok(())
     }
 
-    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+    #[instrument(skip(self), ret)]
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        let c = self.connection().await?;
+
+        let rows = self
+            .prepare_query(
+                &c,
+                "txn_detail_select_timed_out.sql",
+                &[&self.cluster, &now],
+            )
+            .await?;
+
+        // release the listing connection before aborting: each abort_timed_out below checks
+        // out its own connection from the same pool, and the pool can be small
+        // (or exactly 1), so holding this one idle risks starving/deadlocking them.
+        drop(c);
+
+        for row in rows {
+            let transaction_id = row.try_get::<_, String>(0)?;
+            let producer_id = row.try_get::<_, i64>(1)?;
+            let producer_epoch = row.try_get::<_, i16>(2)?;
+
+            match self
+                .abort_timed_out(&transaction_id, producer_id, producer_epoch)
+                .await
+            {
+                Ok(ErrorCode::None) => {}
+                // Benign, expected outcome: the sweep lost a race against a real client that
+                // already finalized this transaction between the SELECT above and this call.
+                // Not an operational problem, so debug! rather than error!.
+                Ok(error_code) => debug!(
+                    ?error_code,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "maintain_transactions: abort rejected"
+                ),
+                Err(ref err) => error!(
+                    ?err,
+                    transaction_id, producer_id, producer_epoch, "maintain_transactions"
+                ),
+            }
+        }
+
         Ok(())
     }
 
@@ -3900,6 +4161,1855 @@ mod tests {
             stage.last_stable,
             stage.high_watermark,
         );
+
+        Ok(())
+    }
+
+    /// A transaction whose timeout has elapsed without the client calling `EndTxn` (a crashed
+    /// or abandoned producer) must be aborted by `maintain_transactions`, releasing the
+    /// `read_committed` last stable offset it was pinning.
+    #[tokio::test]
+    async fn maintain_transactions_aborts_timed_out_transaction() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintain_transactions_aborts_timed_out_transaction: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // a transactional producer begins a transaction and produces, never commits
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"abandoned").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        let stage = storage.offset_stage(&topition).await?;
+
+        assert!(
+            stage.last_stable < stage.high_watermark,
+            "an open transaction must pin last_stable below the high watermark \
+             (last_stable={}, high_watermark={})",
+            stage.last_stable,
+            stage.high_watermark,
+        );
+
+        // no need to actually sleep past the timeout: `now` is a plain parameter,
+        // so pass a `now` far enough ahead that the 10s timeout has "elapsed".
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let stage = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            stage.high_watermark, stage.last_stable,
+            "the timed-out transaction should have been aborted, releasing last_stable \
+             (last_stable={}, high_watermark={})",
+            stage.last_stable, stage.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// A transaction that hasn't reached its own `transaction_timeout_ms` yet must be left
+    /// alone by the sweep -- it should not be aborted just because maintain_transactions ran.
+    #[tokio::test]
+    async fn maintain_transactions_leaves_transaction_before_timeout() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping maintain_transactions_leaves_transaction_before_timeout: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"still-active").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        let before = storage.offset_stage(&topition).await?;
+
+        // `now` is barely past `started_at`, nowhere near the 10s timeout.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_millis(50))
+            .await?;
+
+        let after = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            before.last_stable, after.last_stable,
+            "a transaction within its timeout must not be touched by the sweep \
+             (before={}, after={})",
+            before.last_stable, after.last_stable,
+        );
+        assert!(
+            after.last_stable < after.high_watermark,
+            "the still-open transaction must remain pinned \
+             (last_stable={}, high_watermark={})",
+            after.last_stable,
+            after.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// When a timed-out transaction overlaps an older, still-open transaction on the same
+    /// partition, the sweep must not finalize it out of order: it should stage to
+    /// PREPARE_ABORT and leave the last stable offset exactly where the older transaction
+    /// pins it, until that older transaction resolves too.
+    #[tokio::test]
+    async fn maintain_transactions_defers_when_older_overlapping_transaction_still_open()
+    -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping maintain_transactions_defers_when_older_overlapping_transaction_still_open: {err:?}"
+            );
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // producer A: opens first, given a long timeout, and never resolves -- it's the
+        // oldest open transaction on this partition, so it pins the last stable offset.
+        let txn_a = alphanumeric_string(10);
+        let producer_a = storage
+            .init_producer(Some(txn_a.as_str()), 10_000_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_a.clone(),
+                producer_id: producer_a.id,
+                producer_epoch: producer_a.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_a = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"a").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_a.id)
+            .producer_epoch(producer_a.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_a.as_str()), &topition, batch_a)
+            .await?;
+
+        // producer B: opens second, on the same partition, with a short timeout -- it will
+        // be picked up by the sweep, but must defer to A.
+        let txn_b = alphanumeric_string(10);
+        let producer_b = storage
+            .init_producer(Some(txn_b.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_b.clone(),
+                producer_id: producer_b.id,
+                producer_epoch: producer_b.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_b = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"b").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_b.id)
+            .producer_epoch(producer_b.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_b.as_str()), &topition, batch_b)
+            .await?;
+
+        let before = storage.offset_stage(&topition).await?;
+
+        // far enough ahead for B's 10s timeout to have elapsed, nowhere near A's ~10,000s one.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(20))
+            .await?;
+
+        let after = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            before.last_stable, after.last_stable,
+            "B must not advance last_stable while A (older, still open) remains pinned \
+             (before={}, after={})",
+            before.last_stable, after.last_stable,
+        );
+        assert!(
+            after.last_stable < after.high_watermark,
+            "A is still open, so last_stable must remain pinned below the high watermark \
+             (last_stable={}, high_watermark={})",
+            after.last_stable,
+            after.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// The status guard added to end_in_tx must reject a second, stale call that conflicts
+    /// with what already happened -- this is the exact race maintain_transactions and a
+    /// genuinely concurrent client EndTxn could hit: a candidate found by the sweep's query
+    /// that a real client commits first, then the sweep's stale abort arrives late. The guard
+    /// must not silently ack the sweep's abort as success (that would tell the caller their
+    /// request "worked" when the transaction was actually already committed).
+    #[tokio::test]
+    async fn txn_end_after_already_finalized_with_conflicting_outcome_is_rejected() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_end_after_already_finalized_is_a_no_op: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"raced").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // the "real client" wins the race and commits first.
+        _ = storage
+            .txn_end(&transaction_id, producer.id, producer.epoch, true)
+            .await?;
+
+        let after_commit = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            after_commit.last_stable, after_commit.high_watermark,
+            "the committed transaction should have released last_stable \
+             (last_stable={}, high_watermark={})",
+            after_commit.last_stable, after_commit.high_watermark,
+        );
+
+        // the sweep's stale view still thinks it should abort the same transaction -- but the
+        // real client already committed it. This must be rejected, not silently acked.
+        let error_code = storage
+            .txn_end(&transaction_id, producer.id, producer.epoch, false)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::InvalidTxnState,
+            error_code,
+            "a stale abort arriving after a real commit must be rejected, not acked as \
+             success -- the caller has no other way to learn their request didn't apply"
+        );
+
+        let after_conflict = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            after_commit.high_watermark, after_conflict.high_watermark,
+            "the rejected call must not append a second control-batch marker \
+             (high_watermark before={}, after={})",
+            after_commit.high_watermark, after_conflict.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// A retry (or a genuine race between a real EndTxn and the sweep) that lands while a
+    /// transaction is deferred (PREPARE_ABORT/PREPARE_COMMIT -- an older, still-open
+    /// transaction on the same partition hasn't resolved yet) must not write a second control
+    /// marker. Deferral means the marker was already written on the first call; only the
+    /// overlap check should re-run.
+    #[tokio::test]
+    async fn deferred_txn_end_retry_does_not_duplicate_marker() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping deferred_txn_end_retry_does_not_duplicate_marker: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // producer A: opens first, never resolves -- pins B behind it.
+        let txn_a = alphanumeric_string(10);
+        let producer_a = storage
+            .init_producer(Some(txn_a.as_str()), 10_000_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_a.clone(),
+                producer_id: producer_a.id,
+                producer_epoch: producer_a.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_a = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"a").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_a.id)
+            .producer_epoch(producer_a.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_a.as_str()), &topition, batch_a)
+            .await?;
+
+        // producer B: opens second, overlapping A -- must defer.
+        let txn_b = alphanumeric_string(10);
+        let producer_b = storage
+            .init_producer(Some(txn_b.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_b.clone(),
+                producer_id: producer_b.id,
+                producer_epoch: producer_b.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch_b = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"b").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_b.id)
+            .producer_epoch(producer_b.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_b.as_str()), &topition, batch_b)
+            .await?;
+
+        // first call: B defers (A is still open), writing its abort marker but only reaching
+        // PREPARE_ABORT, not the terminal ABORTED the guard checks for.
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&txn_b, producer_b.id, producer_b.epoch, false)
+                .await?
+        );
+
+        // second call: simulates a retry, or the sweep racing a real client's EndTxn, while B
+        // is still sitting in PREPARE_ABORT. The guard should recognize this as already
+        // handled and no-op -- if it doesn't, a second marker gets written.
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&txn_b, producer_b.id, producer_b.epoch, false)
+                .await?
+        );
+
+        // Two calls while deferred must still result in exactly one control-batch marker
+        // record for producer B on this partition -- a real Kafka client seeing two
+        // conflicting markers for the same producer is undefined/nonsensical behavior. Counted
+        // directly against the record table (aborted_transactions isn't wired up yet at this
+        // point in the stack).
+        let c = storage.connection().await?;
+        let marker_count: i64 = c
+            .query_one(
+                "select count(*) from cluster c \
+                 join topic t on t.cluster = c.id \
+                 join topition tp on tp.topic = t.id \
+                 join record r on r.topition = tp.id \
+                 where c.name = $1 and t.name = $2 and tp.partition = $3 \
+                 and r.producer_id = $4 and (r.attributes & 32) = 32",
+                &[&cluster, &topic_name, &0i32, &producer_b.id],
+            )
+            .await?
+            .try_get(0)?;
+
+        assert_eq!(
+            1, marker_count,
+            "expected exactly one control-batch marker for producer B, got {marker_count}",
+        );
+
+        Ok(())
+    }
+
+    /// Once maintain_transactions sweep-aborts a timed-out transaction, it also fences the
+    /// producer's epoch -- so a LATE real EndTxn(commit=true) for that same transaction (e.g.
+    /// a slow producer that was declared dead but is actually still alive and finally calls
+    /// commit) must be rejected with ProducerFenced, not acked as success -- the data was
+    /// already irreversibly reported as aborted, so telling the caller their commit "worked"
+    /// would be a lie, and ProducerFenced (rather than a generic InvalidTxnState) is what
+    /// tells a real Kafka client library to stop retrying and rebuild its producer.
+    #[tokio::test]
+    async fn late_commit_after_sweep_abort_is_rejected() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping late_commit_after_sweep_abort_is_rejected: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"slow-producer").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // the sweep declares this transaction dead and aborts it.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let stage = storage.offset_stage(&topition).await?;
+        assert_eq!(
+            stage.high_watermark, stage.last_stable,
+            "the sweep should have aborted the timed-out transaction"
+        );
+
+        // the "slow" producer, unaware it's been declared dead, finally calls commit for real.
+        let late_commit_result = storage
+            .txn_end(&transaction_id, producer.id, producer.epoch, true)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::ProducerFenced,
+            late_commit_result,
+            "a late commit() after a sweep-abort must be rejected as ProducerFenced (the \
+             sweep fences the producer's epoch on timeout-abort), not acked as success",
+        );
+
+        Ok(())
+    }
+
+    async fn txn_status(
+        storage: &Postgres,
+        cluster: &str,
+        transaction_id: &str,
+        producer: &ProducerIdResponse,
+    ) -> Result<Option<String>> {
+        let c = storage.connection().await?;
+
+        let row = c
+            .query_one(
+                "select txn_d.status \
+                 from cluster c \
+                 join producer p on p.cluster = c.id \
+                 join producer_epoch pe on pe.producer = p.id \
+                 join txn on txn.cluster = c.id and txn.producer = p.id \
+                 join txn_detail txn_d on txn_d.\"transaction\" = txn.id \
+                 and txn_d.producer_epoch = pe.id \
+                 where c.name = $1 and txn.name = $2 and p.id = $3 and pe.epoch = $4",
+                &[
+                    &cluster.to_owned(),
+                    &transaction_id.to_owned(),
+                    &producer.id,
+                    &producer.epoch,
+                ],
+            )
+            .await?;
+
+        row.try_get::<_, Option<String>>(0).map_err(Into::into)
+    }
+
+    /// Finalizing one epoch's transaction must delete only that epoch's txn_topition and
+    /// txn_produce_offset bookkeeping. The delete_by_txn queries once matched every epoch of
+    /// the (transaction, producer). Reproduced via an epoch-0 abort deferred in PREPARE_ABORT
+    /// (re-init leaves non-BEGIN transactions alone, so the epoch bump keeps it deferred):
+    /// its retained bookkeeping is what eventually tells the deferred abort which partitions
+    /// get markers, so epoch 1's finalize wiping it loses those markers entirely.
+    #[tokio::test]
+    async fn txn_end_scopes_bookkeeping_delete_to_its_own_epoch() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_end_scopes_bookkeeping_delete_to_its_own_epoch: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(2)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let partition_0 = Topition::new(topic_name.clone(), 0);
+        let partition_1 = Topition::new(topic_name.clone(), 1);
+
+        // pinning producer: an open transaction on partition 0 that epoch 0's abort will
+        // defer behind.
+        let txn_pin = alphanumeric_string(10);
+        let producer_pin = storage
+            .init_producer(Some(txn_pin.as_str()), 10_000_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_pin.clone(),
+                producer_id: producer_pin.id,
+                producer_epoch: producer_pin.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch_pin = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"pin").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_pin.id)
+            .producer_epoch(producer_pin.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_pin.as_str()), &partition_0, batch_pin)
+            .await?;
+
+        // epoch 0: produce on partition 0 behind the pin, then abort -- defers to
+        // PREPARE_ABORT, keeping its bookkeeping rows.
+        let txn_a = alphanumeric_string(10);
+        let epoch0 = storage
+            .init_producer(Some(txn_a.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_a.clone(),
+                producer_id: epoch0.id,
+                producer_epoch: epoch0.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch_epoch0 = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"a").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(epoch0.id)
+            .producer_epoch(epoch0.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_a.as_str()), &partition_0, batch_epoch0)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&txn_a, epoch0.id, epoch0.epoch, false)
+                .await?
+        );
+        assert_eq!(
+            Some("PREPARE_ABORT".to_owned()),
+            txn_status(&storage, &cluster, &txn_a, &epoch0).await?,
+            "epoch 0's abort should defer behind the pinning transaction",
+        );
+
+        // reconnect: PREPARE_ABORT is not BEGIN, so re-init bumps the epoch without touching
+        // the deferred transaction.
+        let epoch1 = storage
+            .init_producer(Some(txn_a.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+        assert_eq!(epoch0.id, epoch1.id);
+        assert_eq!(epoch0.epoch + 1, epoch1.epoch);
+
+        // epoch 1: transact on partition 1 (no overlap with the pin) and abort -- finalizes
+        // immediately, running the bookkeeping deletes.
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_a.clone(),
+                producer_id: epoch1.id,
+                producer_epoch: epoch1.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![1])),
+                ],
+            })
+            .await?;
+
+        let batch_epoch1 = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"b").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(epoch1.id)
+            .producer_epoch(epoch1.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_a.as_str()), &partition_1, batch_epoch1)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&txn_a, epoch1.id, epoch1.epoch, false)
+                .await?
+        );
+        assert_eq!(
+            Some("ABORTED".to_owned()),
+            txn_status(&storage, &cluster, &txn_a, &epoch1).await?,
+            "epoch 1 has no overlap and must finalize immediately, running the deletes",
+        );
+
+        let bookkeeping = |epoch: &ProducerIdResponse| {
+            let storage = &storage;
+            let cluster = &cluster;
+            let txn_a = &txn_a;
+            let (id, epoch) = (epoch.id, epoch.epoch);
+            async move {
+                let c = storage.connection().await?;
+                let row = c
+                    .query_one(
+                        "select \
+                         count(distinct txn_tp.id) as topitions, \
+                         count(txn_po.txn_topition) as produce_offsets \
+                         from cluster c \
+                         join producer p on p.cluster = c.id \
+                         join producer_epoch pe on pe.producer = p.id \
+                         join txn on txn.cluster = c.id and txn.producer = p.id \
+                         join txn_detail txn_d on txn_d.\"transaction\" = txn.id \
+                         and txn_d.producer_epoch = pe.id \
+                         join txn_topition txn_tp on txn_tp.txn_detail = txn_d.id \
+                         left join txn_produce_offset txn_po on txn_po.txn_topition = txn_tp.id \
+                         where c.name = $1 and txn.name = $2 and p.id = $3 and pe.epoch = $4",
+                        &[cluster, txn_a, &id, &epoch],
+                    )
+                    .await?;
+                Ok::<_, Error>((row.try_get::<_, i64>(0)?, row.try_get::<_, i64>(1)?))
+            }
+        };
+
+        assert_eq!(
+            (0, 0),
+            bookkeeping(&epoch1).await?,
+            "epoch 1's own bookkeeping should be deleted by its finalize",
+        );
+        assert_eq!(
+            (1, 1),
+            bookkeeping(&epoch0).await?,
+            "epoch 1's finalize must not delete the deferred epoch 0 transaction's \
+             bookkeeping -- it is what tells the deferred abort which partitions get markers",
+        );
+
+        Ok(())
+    }
+
+    /// Stress the race end_in_tx's status guard exists to close: a genuinely concurrent
+    /// live commit (as a real client's EndTxn) and the maintain_transactions sweep's abort,
+    /// both racing txn_end on the exact same transaction. Recovered and adapted from an
+    /// earlier, unmerged exploration (orhayat/fix/pg-txn-timeout-abort) that found this race
+    /// before the guard existed; run here to confirm the guard actually holds under real
+    /// concurrency, not just the sequential simulation above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn race_concurrent_commit_and_abort() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping race_concurrent_commit_and_abort: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let iterations = 100;
+        let mut commit_wins = 0;
+        let mut abort_wins = 0;
+        let mut both_ok = 0;
+        let mut both_err = 0;
+        let mut anomalies: Vec<String> = vec![];
+
+        for i in 0..iterations {
+            let transaction_id = alphanumeric_string(10);
+
+            let producer = storage
+                .init_producer(Some(transaction_id.as_str()), 60_000, Some(-1), Some(-1))
+                .await?;
+
+            _ = storage
+                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                    transaction_id: transaction_id.clone(),
+                    producer_id: producer.id,
+                    producer_epoch: producer.epoch,
+                    topics: vec![
+                        AddPartitionsToTxnTopic::default()
+                            .name(topic_name.clone())
+                            .partitions(Some((0..num_partitions).collect())),
+                    ],
+                })
+                .await?;
+
+            let batch = Batch::builder()
+                .record(Record::builder().value(Bytes::from_static(b"v").into()))
+                .attributes(BatchAttribute::default().transaction(true).into())
+                .producer_id(producer.id)
+                .producer_epoch(producer.epoch)
+                .base_sequence(0)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = storage
+                .produce(Some(transaction_id.as_str()), &topition, batch)
+                .await?;
+
+            let wm_before = storage.offset_stage(&topition).await?.high_watermark;
+
+            let (s1, s2) = (storage.clone(), storage.clone());
+            let (t1, t2) = (transaction_id.clone(), transaction_id.clone());
+            let (pid, ep) = (producer.id, producer.epoch);
+
+            let commit = tokio::spawn(async move { s1.txn_end(&t1, pid, ep, true).await });
+            let abort = tokio::spawn(async move { s2.txn_end(&t2, pid, ep, false).await });
+
+            let r_commit = commit.await.expect("commit task panicked");
+            let r_abort = abort.await.expect("abort task panicked");
+
+            let wm_after = storage.offset_stage(&topition).await?.high_watermark;
+            let markers = wm_after - wm_before;
+            let status = txn_status(&storage, &cluster, &transaction_id, &producer).await?;
+
+            match (r_commit.is_ok(), r_abort.is_ok()) {
+                (true, false) => commit_wins += 1,
+                (false, true) => abort_wins += 1,
+                (true, true) => both_ok += 1,
+                (false, false) => both_err += 1,
+            }
+
+            // The end_in_tx status guard makes the loser of the race a clean
+            // Ok(ErrorCode::None) no-op too (matching how Kafka treats a duplicate
+            // EndTxn), so both calls returning Ok is expected -- it no longer signals
+            // which side "won". The real invariants: exactly one control marker ever
+            // lands, and the transaction settles into a definite terminal state.
+            let consistent =
+                status.as_deref() == Some("COMMITTED") || status.as_deref() == Some("ABORTED");
+            if markers != 1 || !consistent {
+                anomalies.push(format!(
+                    "iter {i}: markers={markers} commit={r_commit:?} abort={r_abort:?} status={status:?}"
+                ));
+            }
+        }
+
+        eprintln!(
+            "summary over {iterations}: commit_wins={commit_wins} abort_wins={abort_wins} both_ok={both_ok} both_err={both_err} anomalies={}",
+            anomalies.len()
+        );
+
+        assert!(
+            anomalies.is_empty(),
+            "{} anomalies (expected exactly 1 marker + status matching the winner every time):\n{}",
+            anomalies.len(),
+            anomalies.join("\n"),
+        );
+
+        Ok(())
+    }
+
+    /// The actual data-safety guarantee fencing exists for: once maintain_transactions
+    /// sweep-aborts a timed-out transaction, a still-alive "zombie" producer trying to send
+    /// MORE data under its old epoch must be rejected outright -- not silently accepted and
+    /// later delivered to read_committed consumers as if it were ordinary committed data.
+    #[tokio::test]
+    async fn sweep_fenced_producer_zombie_produce_is_rejected() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping sweep_fenced_producer_zombie_produce_is_rejected: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"before-sweep").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        // the sweep declares this producer's transaction dead -- and must fence it.
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let stage_before_zombie_write = storage.offset_stage(&topition).await?;
+
+        // the "zombie" producer, still alive, tries to send more data under its old epoch.
+        let zombie_batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"zombie-write").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(1)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let zombie_result = storage
+            .produce(Some(transaction_id.as_str()), &topition, zombie_batch)
+            .await;
+
+        assert!(
+            matches!(zombie_result, Err(Error::Api(ErrorCode::ProducerFenced))),
+            "a zombie produce under the pre-sweep epoch must be rejected as ProducerFenced, \
+             got {zombie_result:?}",
+        );
+
+        let stage_after_zombie_write = storage.offset_stage(&topition).await?;
+
+        assert_eq!(
+            stage_before_zombie_write.high_watermark, stage_after_zombie_write.high_watermark,
+            "the rejected zombie write must not have been appended to the log",
+        );
+
+        Ok(())
+    }
+
+    /// A producer fenced by the sweep must still be able to recover normally -- reconnecting
+    /// via InitProducerId(-1, -1) for the same transactional.id gets a fresh epoch strictly
+    /// after the sweep's fence, and can then produce/commit normally under it.
+    #[tokio::test]
+    async fn sweep_fenced_producer_can_reconnect_and_produce_normally() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping sweep_fenced_producer_can_reconnect_and_produce_normally: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"before-sweep").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+
+        let reconnected = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        assert_eq!(
+            producer.id, reconnected.id,
+            "reconnect must keep the same stable producer_id"
+        );
+        assert!(
+            reconnected.epoch > producer.epoch,
+            "reconnect must return an epoch strictly after the sweep's fence (was {}, now {})",
+            producer.epoch,
+            reconnected.epoch,
+        );
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: transaction_id.clone(),
+                producer_id: reconnected.id,
+                producer_epoch: reconnected.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some((0..num_partitions).collect())),
+                ],
+            })
+            .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"after-reconnect").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(reconnected.id)
+            .producer_epoch(reconnected.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(transaction_id.as_str()), &topition, batch)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .txn_end(&transaction_id, reconnected.id, reconnected.epoch, true)
+                .await?,
+            "the reconnected producer's transaction must commit normally",
+        );
+
+        Ok(())
+    }
+
+    /// EndTxn for a producer id that was never issued must be UnknownProducerId -- the
+    /// identity check runs before any transaction-state lookup, so this cannot be
+    /// misreported as a transaction-state problem.
+    #[tokio::test]
+    async fn txn_end_for_unknown_producer_is_unknown_producer_id() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_end_for_unknown_producer_is_unknown_producer_id: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        assert_eq!(
+            ErrorCode::UnknownProducerId,
+            storage
+                .txn_end(alphanumeric_string(10).as_str(), i64::MAX, 0, false)
+                .await?
+        );
+
+        Ok(())
+    }
+
+    /// EndTxn carrying an epoch NEWER than the broker ever issued is a protocol violation
+    /// (the client invented an epoch), reported as InvalidProducerEpoch -- distinct from
+    /// ProducerFenced, which tells a stale producer a NEWER epoch exists and it should
+    /// rebuild; here nothing newer exists and retrying with a rebuilt producer won't help.
+    #[tokio::test]
+    async fn txn_end_with_future_epoch_is_invalid_producer_epoch() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_end_with_future_epoch_is_invalid_producer_epoch: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        assert_eq!(
+            ErrorCode::InvalidProducerEpoch,
+            storage
+                .txn_end(&transaction_id, producer.id, producer.epoch + 1, true)
+                .await?
+        );
+
+        Ok(())
+    }
+
+    /// A retried sweep-abort (the next maintain tick, or another broker instance sharing
+    /// the database) carries the victim's original epoch, which the first call's fencing
+    /// made stale -- so the retry must be stopped at the identity check as ProducerFenced,
+    /// bumping no second epoch and writing no second control marker.
+    #[tokio::test]
+    async fn sweep_abort_retry_is_fenced_and_does_not_double_bump() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping sweep_abort_retry_is_fenced_and_does_not_double_bump: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // pinning producer: an older open transaction the victim's abort will defer behind,
+        // so the victim sits in PREPARE_ABORT when the retry arrives.
+        let txn_pin = alphanumeric_string(10);
+        let producer_pin = storage
+            .init_producer(Some(txn_pin.as_str()), 10_000_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_pin.clone(),
+                producer_id: producer_pin.id,
+                producer_epoch: producer_pin.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch_pin = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"pin").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(producer_pin.id)
+            .producer_epoch(producer_pin.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_pin.as_str()), &topition, batch_pin)
+            .await?;
+
+        let txn_victim = alphanumeric_string(10);
+        let victim = storage
+            .init_producer(Some(txn_victim.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        _ = storage
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: txn_victim.clone(),
+                producer_id: victim.id,
+                producer_epoch: victim.epoch,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        let batch_victim = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"v").into()))
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(victim.id)
+            .producer_epoch(victim.epoch)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage
+            .produce(Some(txn_victim.as_str()), &topition, batch_victim)
+            .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .abort_timed_out(&txn_victim, victim.id, victim.epoch)
+                .await?
+        );
+        assert_eq!(
+            Some("PREPARE_ABORT".to_owned()),
+            txn_status(&storage, &cluster, &txn_victim, &victim).await?,
+            "the victim's abort should defer behind the pinning transaction",
+        );
+
+        assert_eq!(
+            ErrorCode::ProducerFenced,
+            storage
+                .abort_timed_out(&txn_victim, victim.id, victim.epoch)
+                .await?,
+            "the retry carries the epoch the first call fenced",
+        );
+
+        let c = storage.connection().await?;
+
+        let current_epoch: i16 = c
+            .query_one(
+                "select max(pe.epoch) from cluster c \
+                 join producer p on p.cluster = c.id \
+                 join producer_epoch pe on pe.producer = p.id \
+                 where c.name = $1 and p.id = $2",
+                &[&cluster, &victim.id],
+            )
+            .await?
+            .try_get(0)?;
+
+        assert_eq!(
+            victim.epoch + 1,
+            current_epoch,
+            "two sweep-abort calls must fence exactly once",
+        );
+
+        let marker_count: i64 = c
+            .query_one(
+                "select count(*) from cluster c \
+                 join topic t on t.cluster = c.id \
+                 join topition tp on tp.topic = t.id \
+                 join record r on r.topition = tp.id \
+                 where c.name = $1 and t.name = $2 and tp.partition = $3 \
+                 and r.producer_id = $4 and (r.attributes & 32) = 32",
+                &[&cluster, &topic_name, &0i32, &victim.id],
+            )
+            .await?
+            .try_get(0)?;
+
+        assert_eq!(
+            1, marker_count,
+            "the fenced retry must not write a second control marker",
+        );
+
+        Ok(())
+    }
+
+    /// InitProducerId API versions <= 2 have no wire representation for producer_id/epoch at
+    /// all, so they decode as (None, None) -- must be treated as a fresh-epoch request, not
+    /// panic.
+    #[tokio::test]
+    async fn init_producer_old_api_version_is_treated_as_fresh() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_old_api_version_is_treated_as_fresh: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, None, None)
+            .await?;
+
+        assert_eq!(ErrorCode::None, producer.error);
+
+        Ok(())
+    }
+
+    /// A v3+ client presenting its current, still-valid (producer_id, producer_epoch) -- the
+    /// KIP-360 recovery shape -- must be validated against the record and, once confirmed,
+    /// bumped to a new epoch exactly like a fresh (-1, -1) request.
+    #[tokio::test]
+    async fn init_producer_recovery_with_current_epoch_succeeds() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_recovery_with_current_epoch_succeeds: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        let recovered = storage
+            .init_producer(
+                Some(transaction_id.as_str()),
+                10_000,
+                Some(producer.id),
+                Some(producer.epoch),
+            )
+            .await?;
+
+        assert_eq!(ErrorCode::None, recovered.error);
+        assert_eq!(producer.id, recovered.id);
+        assert!(
+            recovered.epoch > producer.epoch,
+            "a validated recovery request must still bump the epoch (was {}, now {})",
+            producer.epoch,
+            recovered.epoch,
+        );
+
+        Ok(())
+    }
+
+    /// A v3+ client presenting a STALE (producer_id, producer_epoch) -- exactly what happens
+    /// after maintain_transactions' sweep fences a timed-out producer -- must be rejected as
+    /// ProducerFenced, not silently granted a new epoch (and not panic).
+    #[tokio::test]
+    async fn init_producer_recovery_with_stale_epoch_is_fenced() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_recovery_with_stale_epoch_is_fenced: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        // someone else bumps the epoch (a reconnect, or the sweep fencing this producer),
+        // making `producer`'s epoch stale.
+        _ = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        let stale_recovery = storage
+            .init_producer(
+                Some(transaction_id.as_str()),
+                10_000,
+                Some(producer.id),
+                Some(producer.epoch),
+            )
+            .await?;
+
+        assert_eq!(
+            ErrorCode::ProducerFenced,
+            stale_recovery.error,
+            "a recovery request carrying a stale epoch must be rejected as ProducerFenced"
+        );
+
+        Ok(())
+    }
+
+    /// A malformed InitProducerId request -- one of producer_id/producer_epoch present
+    /// without the other -- is not a valid shape under any protocol version and must be
+    /// rejected, not panic.
+    #[tokio::test]
+    async fn init_producer_malformed_partial_fields_is_rejected() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping init_producer_malformed_partial_fields_is_rejected: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+
+        let response = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(42), None)
+            .await?;
+
+        assert_eq!(ErrorCode::InvalidRequest, response.error);
+
+        Ok(())
+    }
+
+    /// AddPartitionsToTxn is idempotent in Kafka: a partition already in the transaction is
+    /// a no-op, not an error. Clients do re-send it -- a retry, or a produce racing the
+    /// first add -- and the unique (txn_detail, topition) constraint turned that into a
+    /// database error surfacing as a broken connection mid-transaction.
+    #[tokio::test]
+    async fn txn_add_partitions_is_idempotent() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping txn_add_partitions_is_idempotent: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let num_partitions = 1;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(num_partitions)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        let request = || TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: transaction_id.clone(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            topics: vec![
+                AddPartitionsToTxnTopic::default()
+                    .name(topic_name.clone())
+                    .partitions(Some((0..num_partitions).collect())),
+            ],
+        };
+
+        for attempt in 1..=2 {
+            let response = storage
+                .txn_add_partitions(request())
+                .await
+                .inspect_err(|err| {
+                    panic!("add #{attempt} of the same partition must succeed, got {err:?}")
+                })?;
+
+            for topic in response.zero_to_three() {
+                for partition in topic.results_by_partition.as_deref().unwrap_or_default() {
+                    assert_eq!(
+                        i16::from(ErrorCode::None),
+                        partition.partition_error_code,
+                        "add #{attempt} of the same partition must report no error",
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
