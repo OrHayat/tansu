@@ -80,6 +80,11 @@ use crate::{
     sql::{default_hash, idempotent_sequence_check},
 };
 
+/// Most records a single fetch reads before the byte limit is applied. The
+/// response is whichever of the two limits binds first, so a fetch that is
+/// capped here just leaves the rest for the next one.
+const FETCH_MAX_RECORDS: i64 = 4096;
+
 /// PostgreSQL Storage Engine
 #[derive(Clone, Debug)]
 pub struct Postgres {
@@ -2191,6 +2196,7 @@ impl Storage for Postgres {
                     &(max_bytes as i64),
                     &high_watermark,
                     &key,
+                    &FETCH_MAX_RECORDS,
                 ],
             )
             .await
@@ -2206,6 +2212,7 @@ impl Storage for Postgres {
                     &offset,
                     &(max_bytes as i64),
                     &high_watermark,
+                    &FETCH_MAX_RECORDS,
                 ],
             )
             .await

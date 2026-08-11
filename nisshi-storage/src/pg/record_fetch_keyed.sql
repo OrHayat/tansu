@@ -13,8 +13,11 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, bytea) as
-with sized as (
+-- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, bytea, integer) as
+
+-- see record_fetch.sql: the row cap has to sit in its own query block so it
+-- bounds what the running byte total is computed over.
+with bounded as (
 select
 
 r.offset_id,
@@ -22,10 +25,9 @@ r.attributes,
 r.timestamp,
 r.k,
 r.v,
-sum(coalesce(length(r.k), 0) + coalesce(length(r.v), 0)) over (order by r.offset_id) as bytes,
 r.producer_id,
 r.producer_epoch,
-r.transaction_id < pg_snapshot_xmin(pg_current_snapshot())
+r.transaction_id
 
 from
 
@@ -40,8 +42,25 @@ c.name = $1
 and t.name = $2
 and tp.partition = $3
 and r.offset_id >= $4
--- and r.transaction_id < pg_snapshot_xmin(pg_current_snapshot())
 and r.offset_id < $6
-and r.k = convert_to($7, 'UTF-8'))
+and r.k = convert_to($7, 'UTF-8')
 
-select * from sized where bytes < $5;
+order by r.offset_id
+limit $8),
+
+sized as (
+select
+
+b.offset_id,
+b.attributes,
+b.timestamp,
+b.k,
+b.v,
+sum(coalesce(length(b.k), 0) + coalesce(length(b.v), 0)) over (order by b.offset_id) as bytes,
+b.producer_id,
+b.producer_epoch,
+b.transaction_id < pg_snapshot_xmin(pg_current_snapshot())
+
+from bounded b)
+
+select * from sized where bytes < $5 order by offset_id;
