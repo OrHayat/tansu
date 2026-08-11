@@ -2212,6 +2212,55 @@ impl Storage for Postgres {
             .inspect_err(|err| error!(?err))?
         };
 
+        // every header for the fetch in one round trip: querying them per record
+        // put a round trip inside the record loop, so a fetch over a partition
+        // holding tens of thousands of records spent its entire budget on them
+        // and the consumer timed out before the first response
+        let mut offsets = Vec::with_capacity(records.len());
+
+        for record in records.iter() {
+            offsets.push(
+                record
+                    .try_get::<_, i64>(0)
+                    .inspect_err(|err| error!(?err))?,
+            );
+        }
+
+        let mut headers: BTreeMap<i64, Vec<(Option<Bytes>, Option<Bytes>)>> = BTreeMap::new();
+
+        if !offsets.is_empty() {
+            for header in self
+                .tx_prepare_query(
+                    &tx,
+                    "header_fetch_range_pg.sql",
+                    &[
+                        &self.cluster,
+                        &topition.topic(),
+                        &topition.partition(),
+                        &offsets,
+                    ],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?
+            {
+                let offset = header
+                    .try_get::<_, i64>(0)
+                    .inspect_err(|err| error!(?err))?;
+
+                let k = header
+                    .try_get::<_, Option<&[u8]>>(1)
+                    .map(|k| k.map(Bytes::copy_from_slice))
+                    .inspect_err(|err| error!(?err))?;
+
+                let v = header
+                    .try_get::<_, Option<&[u8]>>(2)
+                    .map(|v| v.map(Bytes::copy_from_slice))
+                    .inspect_err(|err| error!(?err))?;
+
+                headers.entry(offset).or_default().push((k, v));
+            }
+        }
+
         let mut batches = vec![];
 
         if let Some(first) = records.first() {
@@ -2341,35 +2390,15 @@ impl Storage for Postgres {
                     .key(k)
                     .value(v);
 
-                for header in self
-                    .tx_prepare_query(
-                        &tx,
-                        "header_fetch.sql",
-                        &[
-                            &self.cluster,
-                            &topition.topic(),
-                            &topition.partition(),
-                            &offset,
-                        ],
-                    )
-                    .await
-                    .inspect(|row| debug!(?row))
-                    .inspect_err(|err| error!(?err))?
-                {
+                for (k, v) in headers.get(&offset).map(Vec::as_slice).unwrap_or_default() {
                     let mut header_builder = Header::builder();
 
-                    if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(0)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::copy_from_slice(k));
+                    if let Some(k) = k {
+                        header_builder = header_builder.key(k.clone());
                     }
 
-                    if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::copy_from_slice(v));
+                    if let Some(v) = v {
+                        header_builder = header_builder.value(v.clone());
                     }
 
                     record_builder = record_builder.header(header_builder);
