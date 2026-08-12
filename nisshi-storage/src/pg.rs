@@ -2242,7 +2242,9 @@ impl Storage for Postgres {
                     "header_fetch_range_pg.sql",
                     &[
                         &self.cluster,
-                        &topition.topic(),
+                        // base_topic, not topition.topic(): a keyed virtual topic's
+                        // "base/key" name matches no topic row and silently drops headers
+                        &base_topic,
                         &topition.partition(),
                         &offsets,
                     ],
@@ -6165,6 +6167,127 @@ mod tests {
             keys.iter().map(|key| key.to_string()).collect::<Vec<_>>(),
             fetched,
             "headers must be served in produce order, repeats included",
+        );
+
+        Ok(())
+    }
+
+    /// Fetching through a keyed virtual topic ("base/key") must attach each record's
+    /// headers: the record query resolves the base topic name, but the header query was
+    /// handed the raw "base/key" name, which matches no topic row -- so keyed fetches
+    /// silently dropped every header.
+    #[tokio::test]
+    async fn keyed_virtual_topic_fetch_attaches_headers() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::CreatableTopicConfig;
+
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping keyed_virtual_topic_fetch_attaches_headers: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        [CreatableTopicConfig::default()
+                            .name("tansu.virtual".into())
+                            .value(Some("true".into()))]
+                        .into(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Bytes::from_static(b"KEY_A").into())
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0)
+                    .header(
+                        Header::builder()
+                            .key(Bytes::from_static(b"h"))
+                            .value(Bytes::from_static(b"for-a")),
+                    ),
+            )
+            .record(
+                Record::builder()
+                    .key(Bytes::from_static(b"KEY_B").into())
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1)
+                    .header(
+                        Header::builder()
+                            .key(Bytes::from_static(b"h"))
+                            .value(Bytes::from_static(b"for-b")),
+                    ),
+            )
+            .last_offset_delta(1)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let keyed = Topition::new(format!("{topic_name}/KEY_A"), 0);
+
+        let batches = storage
+            .fetch(
+                &keyed,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        let records = batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            Batch::try_from(batch).map(|inflated| {
+                acc.extend(inflated.records);
+                acc
+            })
+        })?;
+
+        assert_eq!(1, records.len());
+        assert_eq!(Some(Bytes::from_static(b"KEY_A")), records[0].key);
+
+        let headers = records[0]
+            .headers
+            .iter()
+            .map(|header| (header.key.clone(), header.value.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![(
+                Some(Bytes::from_static(b"h")),
+                Some(Bytes::from_static(b"for-a"))
+            )],
+            headers,
+            "a keyed virtual topic fetch must attach the record's headers",
         );
 
         Ok(())
