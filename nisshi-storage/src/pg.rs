@@ -6292,4 +6292,133 @@ mod tests {
 
         Ok(())
     }
+
+    /// A fetch returns at most FETCH_MAX_RECORDS records, so a consumer reads a large
+    /// partition in several rounds: each response must make progress, offsets must stay
+    /// contiguous across the cap boundary, and the consumer must reach the high watermark
+    /// with no gaps or duplicates. Nothing else exercises the cap.
+    #[tokio::test]
+    async fn fetch_paginates_past_the_max_records_cap() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping fetch_paginates_past_the_max_records_cap: {err:?}");
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // comfortably past FETCH_MAX_RECORDS (4096) so the consumer needs several rounds
+        let total = 5_000usize;
+        assert!(total as i64 > FETCH_MAX_RECORDS);
+        let batch_size = 500;
+
+        for _ in 0..(total / batch_size) {
+            let batch = (0..batch_size)
+                .fold(Batch::builder(), |builder, delta| {
+                    builder.record(
+                        Record::builder()
+                            .value(Bytes::from_static(b"x").into())
+                            .offset_delta(delta as i32),
+                    )
+                })
+                .last_offset_delta((batch_size - 1) as i32)
+                .base_sequence(0)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = storage.produce(None, &topition, batch).await?;
+        }
+
+        let high_watermark = storage.offset_stage(&topition).await?.high_watermark;
+        assert_eq!(total as i64, high_watermark);
+
+        let mut offset = 0i64;
+        let mut rounds = 0;
+
+        while offset < high_watermark {
+            rounds += 1;
+            assert!(
+                rounds <= 100,
+                "consumer stopped making progress at offset {offset} after {rounds} rounds",
+            );
+
+            let batches = storage
+                .fetch(
+                    &topition,
+                    offset,
+                    1,
+                    4 * 1024 * 1024,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(5),
+                )
+                .await?;
+
+            let mut fetched = 0i64;
+
+            for batch in batches {
+                let inflated = Batch::try_from(batch)?;
+
+                for record in &inflated.records {
+                    assert_eq!(
+                        offset + fetched,
+                        inflated.base_offset + i64::from(record.offset_delta),
+                        "offsets must stay contiguous across fetch rounds",
+                    );
+                    fetched += 1;
+                }
+            }
+
+            assert!(
+                fetched > 0,
+                "a fetch below the high watermark must return records \
+                 (offset {offset}, high watermark {high_watermark})",
+            );
+            assert!(
+                fetched <= FETCH_MAX_RECORDS,
+                "a fetch must not exceed FETCH_MAX_RECORDS, got {fetched}",
+            );
+
+            offset += fetched;
+        }
+
+        assert_eq!(
+            high_watermark, offset,
+            "consumer must land exactly on the high watermark"
+        );
+        assert!(
+            rounds >= 2,
+            "{total} records over a {FETCH_MAX_RECORDS} cap must take several rounds, took {rounds}",
+        );
+
+        Ok(())
+    }
 }
