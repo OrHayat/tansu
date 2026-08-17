@@ -2245,8 +2245,6 @@ impl Storage for Postgres {
                         .inspect_err(|err| error!(?err))?,
                 );
 
-            let mut previous_offset = None;
-
             for record in records.iter() {
                 let attributes = record
                     .try_get::<_, Option<i16>>(1)
@@ -2260,11 +2258,6 @@ impl Storage for Postgres {
                 let producer_epoch = record
                     .try_get::<_, Option<i16>>(7)
                     .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-
-                let completed = record
-                    .try_get::<_, bool>(8)
-                    .inspect(|completed| debug!(?completed))
                     .inspect_err(|err| error!(?err))?;
 
                 if batch_builder.attributes != attributes
@@ -2298,14 +2291,6 @@ impl Storage for Postgres {
                     .try_get::<_, i64>(0)
                     .inspect(|offset| debug!(offset))
                     .inspect_err(|err| error!(?err))?;
-
-                if !completed
-                    && previous_offset
-                        .inspect(|previous_offset| debug!(previous_offset))
-                        .is_none_or(|previous_offset| previous_offset + 1 != offset)
-                {
-                    break;
-                }
 
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
@@ -2371,8 +2356,6 @@ impl Storage for Postgres {
 
                     record_builder = record_builder.header(header_builder);
                 }
-
-                previous_offset = Some(offset);
 
                 batch_builder = batch_builder
                     .record(record_builder)
@@ -6010,6 +5993,111 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Fetch must serve committed records even while an unrelated database transaction is
+    /// open. Produce serializes offset allocation per partition through the watermark row
+    /// lock (held to commit), so every visible row below the committed high watermark is
+    /// final -- there is no in-flight insert a fetch could incorrectly stream past, and no
+    /// reason to withhold rows waiting on the global transaction horizon (xmin).
+    #[tokio::test]
+    async fn fetch_serves_committed_records_despite_concurrent_transaction() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!(
+                "skipping fetch_serves_committed_records_despite_concurrent_transaction: {err:?}"
+            );
+            return Ok(());
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name.clone(), 0);
+
+        // an unrelated transaction with an assigned xid, held open across the produce
+        // and fetch -- as any concurrent produce to another partition, sweep tick, or
+        // slow client elsewhere in the database would hold one
+        let mut held_connection = storage.connection().await?;
+        let held = held_connection.transaction().await?;
+        _ = held.query_one("select pg_current_xact_id()", &[]).await?;
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"a").into())
+                    .offset_delta(0),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"b").into())
+                    .offset_delta(1),
+            )
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"c").into())
+                    .offset_delta(2),
+            )
+            .last_offset_delta(2)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let batches = storage
+            .fetch(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+            .await?;
+
+        held.rollback().await?;
+
+        let records = batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            Batch::try_from(batch).map(|inflated| {
+                acc.extend(inflated.records);
+                acc
+            })
+        })?;
+
+        assert_eq!(
+            3,
+            records.len(),
+            "all committed records must be served regardless of unrelated open transactions",
+        );
 
         Ok(())
     }

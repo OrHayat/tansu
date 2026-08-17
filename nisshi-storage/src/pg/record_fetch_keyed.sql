@@ -24,8 +24,7 @@ r.k,
 r.v,
 sum(coalesce(length(r.k), 0) + coalesce(length(r.v), 0)) over (order by r.offset_id) as bytes,
 r.producer_id,
-r.producer_epoch,
-r.transaction_id < pg_snapshot_xmin(pg_current_snapshot())
+r.producer_epoch
 
 from
 
@@ -40,8 +39,7 @@ c.name = $1
 and t.name = $2
 and tp.partition = $3
 and r.offset_id >= $4
--- and r.transaction_id < pg_snapshot_xmin(pg_current_snapshot())
 and r.offset_id < $6
 and r.k = convert_to($7, 'UTF-8'))
 
-select * from sized where bytes < $5;
+select * from sized where bytes < $5 order by offset_id;
